@@ -29,7 +29,14 @@ pub(crate) struct Client {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UnavailableItem {
     pub(crate) id: String,
+    pub(crate) title: String,
     pub(crate) reason: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct QueuedArticle {
+    pub(crate) id: String,
+    pub(crate) title: String,
 }
 
 #[derive(Debug, Error)]
@@ -97,7 +104,7 @@ impl Client {
         }
     }
 
-    pub(crate) async fn queued_article_ids(&self, limit: u8) -> Result<Vec<String>, Error> {
+    pub(crate) async fn queued_articles(&self, limit: u8) -> Result<Vec<QueuedArticle>, Error> {
         let limit = limit.to_string();
         let listed: ItemList = self
             .http
@@ -114,7 +121,14 @@ impl Client {
             .json()
             .await?;
 
-        Ok(listed.results.into_iter().map(|item| item.id).collect())
+        Ok(listed
+            .results
+            .into_iter()
+            .map(|item| QueuedArticle {
+                id: item.id,
+                title: item.title.trim().to_owned(),
+            })
+            .collect())
     }
 
     pub(crate) async fn fetch_article(&self, id: &str) -> Result<ItemOutcome, Error> {
@@ -173,6 +187,7 @@ struct ItemList {
 #[derive(Deserialize)]
 struct ItemSummary {
     id: String,
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -197,10 +212,12 @@ impl Item {
             id: id.clone(),
             source,
         })?;
+        let title = title.trim().to_owned();
 
         if processing_status != "completed" {
             return Ok(ItemOutcome::Unavailable(UnavailableItem {
                 id,
+                title: title.clone(),
                 reason: format!("content extraction is {processing_status}"),
             }));
         }
@@ -208,6 +225,7 @@ impl Item {
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
             return Ok(ItemOutcome::Unavailable(UnavailableItem {
                 id,
+                title: title.clone(),
                 reason: "Matter returned no extracted Markdown".to_owned(),
             }));
         };
@@ -286,6 +304,7 @@ mod tests {
             item.into_availability().unwrap(),
             ItemOutcome::Unavailable(UnavailableItem {
                 id: "itm_123".to_owned(),
+                title: "A saved article".to_owned(),
                 reason: "content extraction is processing".to_owned(),
             })
         );
@@ -308,6 +327,7 @@ mod tests {
             item.into_availability().unwrap(),
             ItemOutcome::Unavailable(UnavailableItem {
                 id: "itm_123".to_owned(),
+                title: "A saved article".to_owned(),
                 reason: "Matter returned no extracted Markdown".to_owned(),
             })
         );

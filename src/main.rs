@@ -1,3 +1,9 @@
+use std::{
+    env,
+    io::{self, IsTerminal},
+};
+
+use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, pin_mut, stream};
@@ -58,17 +64,18 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     }
 
     let client = matter::Client::new(token);
-    let ids = client
-        .queued_article_ids(limit)
+    let articles = client
+        .queued_articles(limit)
         .await
         .context("failed to list queued Matter articles")?;
-    let fetches = stream::iter(ids)
-        .map(|id| {
+    let color = color_enabled();
+    let fetches = stream::iter(articles)
+        .map(|item| {
             let client = client.clone();
 
             async move {
-                let outcome = client.fetch_article(&id).await;
-                (id, outcome)
+                let outcome = client.fetch_article(&item.id).await;
+                (item, outcome)
             }
         })
         .buffer_unordered(MAX_CONCURRENT_FETCHES);
@@ -77,24 +84,22 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     let mut available = 0;
     let mut failures = 0;
 
-    while let Some((id, outcome)) = fetches.next().await {
+    while let Some((item, outcome)) = fetches.next().await {
         match outcome {
             Ok(matter::ItemOutcome::Available(article)) => {
                 available += 1;
-                println!(
-                    "{}\n  title: {}\n  url: {}\n  words: {}",
-                    article.source_id,
-                    article.title,
-                    article.url,
-                    article.word_count(),
-                );
+                println!("{}", format_article(&article, color));
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
-                eprintln!("Unavailable {}: {}", item.id, item.reason);
+                eprintln!("{}", format_unavailable(&item, color));
             }
             Err(error) => {
                 failures += 1;
-                eprintln!("Failed {}: {error}", id);
+                eprintln!(
+                    "Failed: {}\n  {error} · Matter: {}",
+                    render_title(&item.title, color),
+                    item.id,
+                );
             }
         }
     }
@@ -110,6 +115,38 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn color_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn format_article(article: &article::Article, color: bool) -> String {
+    format!(
+        "{}\n  {}\n  {} words · Matter: {}",
+        render_title(&article.title, color),
+        article.url,
+        article.word_count(),
+        article.source_id,
+    )
+}
+
+fn format_unavailable(item: &matter::UnavailableItem, color: bool) -> String {
+    format!(
+        "Unavailable: {}\n  {} · Matter: {}",
+        render_title(&item.title, color),
+        item.reason,
+        item.id,
+    )
+}
+
+fn render_title(title: &str, color: bool) -> String {
+    if color {
+        let style = Style::new().bold();
+        format!("{style}{title}{style:#}")
+    } else {
+        title.to_owned()
+    }
+}
+
 fn parse_limit(value: &str) -> std::result::Result<u8, String> {
     let limit = value
         .parse::<u8>()
@@ -119,5 +156,35 @@ fn parse_limit(value: &str) -> std::result::Result<u8, String> {
         Ok(limit)
     } else {
         Err("limit must be between 1 and 20".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_article, render_title};
+    use crate::article::Article;
+    use url::Url;
+
+    #[test]
+    fn plain_article_output_leads_with_the_title() {
+        let article = Article {
+            source_id: "itm_123".to_owned(),
+            title: "A saved article".to_owned(),
+            url: Url::parse("https://example.com/article").unwrap(),
+            markdown: "Article body".to_owned(),
+        };
+
+        assert_eq!(
+            format_article(&article, false),
+            "A saved article\n  https://example.com/article\n  2 words · Matter: itm_123"
+        );
+    }
+
+    #[test]
+    fn styled_title_is_bold() {
+        assert_eq!(
+            render_title("A saved article", true),
+            "\u{1b}[1mA saved article\u{1b}[0m"
+        );
     }
 }
