@@ -1,6 +1,7 @@
 use crate::article::Article;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
+use thiserror::Error;
 use url::Url;
 
 const API_BASE_URL: &str = "https://api.getmatter.com/public/v1";
@@ -12,13 +13,32 @@ pub(crate) struct Client {
 
 pub(crate) struct QueueArticles {
     pub(crate) articles: Vec<Article>,
-    pub(crate) skipped: Vec<SkippedItem>,
+    pub(crate) unavailable: Vec<UnavailableItem>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SkippedItem {
+pub(crate) struct UnavailableItem {
     pub(crate) id: String,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum Error {
+    #[error("Matter API request failed")]
+    Request(#[from] reqwest::Error),
+
+    #[error("Matter item {id} has an invalid URL")]
+    InvalidUrl {
+        id: String,
+        #[source]
+        source: url::ParseError,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ItemOutcome {
+    Available(Article),
+    Unavailable(UnavailableItem),
 }
 
 impl Client {
@@ -29,7 +49,7 @@ impl Client {
         }
     }
 
-    pub(crate) async fn queue_articles(&self, limit: u8) -> Result<QueueArticles, reqwest::Error> {
+    pub(crate) async fn queue_articles(&self, limit: u8) -> Result<QueueArticles, Error> {
         let limit = limit.to_string();
         let listed: ItemList = self
             .http
@@ -47,20 +67,24 @@ impl Client {
             .await?;
 
         let mut articles = Vec::new();
-        let mut skipped = Vec::new();
+        let mut unavailable = Vec::new();
 
         for summary in listed.results {
-            match self.item(&summary.id).await?.into_article() {
-                Ok(article) => articles.push(article),
-                Err(item) => skipped.push(item),
+            match self.item(&summary.id).await?.into_availability()? {
+                ItemOutcome::Available(article) => articles.push(article),
+                ItemOutcome::Unavailable(item) => unavailable.push(item),
             }
         }
 
-        Ok(QueueArticles { articles, skipped })
+        Ok(QueueArticles {
+            articles,
+            unavailable,
+        })
     }
 
-    async fn item(&self, id: &str) -> Result<Item, reqwest::Error> {
-        self.http
+    async fn item(&self, id: &str) -> Result<Item, Error> {
+        Ok(self
+            .http
             .get(format!("{API_BASE_URL}/items/{id}"))
             .bearer_auth(&self.token)
             .query(&[("include", "markdown")])
@@ -68,7 +92,7 @@ impl Client {
             .await?
             .error_for_status()?
             .json()
-            .await
+            .await?)
     }
 }
 
@@ -92,7 +116,7 @@ struct Item {
 }
 
 impl Item {
-    fn into_article(self) -> Result<Article, SkippedItem> {
+    fn into_availability(self) -> Result<ItemOutcome, Error> {
         let Self {
             id,
             title,
@@ -100,43 +124,37 @@ impl Item {
             processing_status,
             markdown,
         } = self;
+        let url = Url::parse(&url).map_err(|source| Error::InvalidUrl {
+            id: id.clone(),
+            source,
+        })?;
 
         if processing_status != "completed" {
-            return Err(SkippedItem {
+            return Ok(ItemOutcome::Unavailable(UnavailableItem {
                 id,
                 reason: format!("content extraction is {processing_status}"),
-            });
+            }));
         }
 
-        let url = match Url::parse(&url) {
-            Ok(url) => url,
-            Err(_) => {
-                return Err(SkippedItem {
-                    id,
-                    reason: "Matter returned an invalid URL".to_owned(),
-                });
-            }
-        };
-
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
-            return Err(SkippedItem {
+            return Ok(ItemOutcome::Unavailable(UnavailableItem {
                 id,
                 reason: "Matter returned no extracted Markdown".to_owned(),
-            });
+            }));
         };
 
-        Ok(Article {
+        Ok(ItemOutcome::Available(Article {
             source_id: id,
             title: title.trim().to_owned(),
             url,
             markdown,
-        })
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Item;
+    use super::{Error, Item, ItemOutcome, UnavailableItem};
 
     #[test]
     fn completed_item_maps_to_an_article() {
@@ -151,17 +169,18 @@ mod tests {
         )
         .unwrap();
 
-        let article = item.into_article().unwrap();
+        let ItemOutcome::Available(article) = item.into_availability().unwrap() else {
+            panic!("expected an available article");
+        };
 
         assert_eq!(article.source_id, "itm_123");
         assert_eq!(article.title, "A saved article");
         assert_eq!(article.url.as_str(), "https://example.com/article");
-
         assert_eq!(article.word_count(), 4);
     }
 
     #[test]
-    fn item_with_an_invalid_url_is_skipped() {
+    fn item_with_an_invalid_url_fails() {
         let item: Item = serde_json::from_str(
             r#"{
                 "id": "itm_123",
@@ -173,17 +192,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            item.into_article().unwrap_err(),
-            super::SkippedItem {
-                id: "itm_123".to_owned(),
-                reason: "Matter returned an invalid URL".to_owned(),
-            }
-        );
+        assert!(matches!(
+            item.into_availability(),
+            Err(Error::InvalidUrl { id, .. }) if id == "itm_123"
+        ));
     }
 
     #[test]
-    fn item_without_completed_markdown_is_skipped() {
+    fn processing_item_is_unavailable() {
         let item: Item = serde_json::from_str(
             r#"{
                 "id": "itm_123",
@@ -196,11 +212,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            item.into_article().unwrap_err(),
-            super::SkippedItem {
+            item.into_availability().unwrap(),
+            ItemOutcome::Unavailable(UnavailableItem {
                 id: "itm_123".to_owned(),
                 reason: "content extraction is processing".to_owned(),
-            }
+            })
+        );
+    }
+
+    #[test]
+    fn completed_item_without_markdown_is_unavailable() {
+        let item: Item = serde_json::from_str(
+            r#"{
+                "id": "itm_123",
+                "title": "A saved article",
+                "url": "https://example.com/article",
+                "processing_status": "completed",
+                "markdown": "   "
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            item.into_availability().unwrap(),
+            ItemOutcome::Unavailable(UnavailableItem {
+                id: "itm_123".to_owned(),
+                reason: "Matter returned no extracted Markdown".to_owned(),
+            })
         );
     }
 }

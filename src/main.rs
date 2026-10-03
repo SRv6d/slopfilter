@@ -52,8 +52,8 @@ async fn scan(limit: u8, dry_run: bool) -> Result<()> {
         .await
         .context("failed to fetch queued Matter articles")?;
 
-    for skipped in &result.skipped {
-        eprintln!("Skipping {}: {}", skipped.id, skipped.reason);
+    for unavailable in &result.unavailable {
+        eprintln!("Unavailable {}: {}", unavailable.id, unavailable.reason);
     }
 
     if result.articles.is_empty() {
