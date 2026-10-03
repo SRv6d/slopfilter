@@ -1,19 +1,27 @@
+use std::{sync::Arc, time::Duration};
+
 use crate::article::Article;
-use reqwest::Client as HttpClient;
+use reqwest::{
+    Client as HttpClient, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::{
+    sync::Mutex,
+    time::{Instant, sleep_until},
+};
 use url::Url;
 
 const API_BASE_URL: &str = "https://api.getmatter.com/public/v1";
+const CONTENT_REQUEST_INTERVAL: Duration = Duration::from_millis(3_100);
+const MAX_RATE_LIMIT_RETRIES: u8 = 3;
 
+#[derive(Clone)]
 pub(crate) struct Client {
     http: HttpClient,
     token: String,
-}
-
-pub(crate) struct QueueArticles {
-    pub(crate) articles: Vec<Article>,
-    pub(crate) unavailable: Vec<UnavailableItem>,
+    content_limiter: Arc<ContentRateLimiter>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,12 +41,43 @@ pub(crate) enum Error {
         #[source]
         source: url::ParseError,
     },
+
+    #[error("Matter rate limit persisted while fetching {id} after {retries} retries")]
+    RateLimited { id: String, retries: u8 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ItemOutcome {
+pub(crate) enum ItemOutcome {
     Available(Article),
     Unavailable(UnavailableItem),
+}
+
+struct ContentRateLimiter {
+    next_request: Mutex<Instant>,
+}
+
+impl ContentRateLimiter {
+    fn new() -> Self {
+        Self {
+            next_request: Mutex::new(Instant::now()),
+        }
+    }
+
+    async fn acquire(&self) {
+        let request_at = {
+            let mut next_request = self.next_request.lock().await;
+            let request_at = (*next_request).max(Instant::now());
+            *next_request = request_at + CONTENT_REQUEST_INTERVAL;
+            request_at
+        };
+
+        sleep_until(request_at).await;
+    }
+
+    async fn defer(&self, delay: Duration) {
+        let mut next_request = self.next_request.lock().await;
+        *next_request = (*next_request).max(Instant::now() + delay);
+    }
 }
 
 impl Client {
@@ -46,10 +85,11 @@ impl Client {
         Self {
             http: HttpClient::new(),
             token,
+            content_limiter: Arc::new(ContentRateLimiter::new()),
         }
     }
 
-    pub(crate) async fn queue_articles(&self, limit: u8) -> Result<QueueArticles, Error> {
+    pub(crate) async fn queued_article_ids(&self, limit: u8) -> Result<Vec<String>, Error> {
         let limit = limit.to_string();
         let listed: ItemList = self
             .http
@@ -66,34 +106,55 @@ impl Client {
             .json()
             .await?;
 
-        let mut articles = Vec::new();
-        let mut unavailable = Vec::new();
+        Ok(listed.results.into_iter().map(|item| item.id).collect())
+    }
 
-        for summary in listed.results {
-            match self.item(&summary.id).await?.into_availability()? {
-                ItemOutcome::Available(article) => articles.push(article),
-                ItemOutcome::Unavailable(item) => unavailable.push(item),
-            }
-        }
-
-        Ok(QueueArticles {
-            articles,
-            unavailable,
-        })
+    pub(crate) async fn fetch_article(&self, id: &str) -> Result<ItemOutcome, Error> {
+        self.item(id).await?.into_availability()
     }
 
     async fn item(&self, id: &str) -> Result<Item, Error> {
-        Ok(self
-            .http
-            .get(format!("{API_BASE_URL}/items/{id}"))
-            .bearer_auth(&self.token)
-            .query(&[("include", "markdown")])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            self.content_limiter.acquire().await;
+
+            let response = self
+                .http
+                .get(format!("{API_BASE_URL}/items/{id}"))
+                .bearer_auth(&self.token)
+                .query(&[("include", "markdown")])
+                .send()
+                .await?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                self.content_limiter
+                    .defer(retry_after(response.headers()))
+                    .await;
+
+                if attempt == MAX_RATE_LIMIT_RETRIES {
+                    return Err(Error::RateLimited {
+                        id: id.to_owned(),
+                        retries: MAX_RATE_LIMIT_RETRIES,
+                    });
+                }
+
+                continue;
+            }
+
+            return Ok(response.error_for_status()?.json().await?);
+        }
+
+        unreachable!("a bounded retry loop always returns")
     }
+}
+
+fn retry_after(headers: &HeaderMap) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(CONTENT_REQUEST_INTERVAL)
 }
 
 #[derive(Deserialize)]
@@ -154,7 +215,9 @@ impl Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Item, ItemOutcome, UnavailableItem};
+    use super::{CONTENT_REQUEST_INTERVAL, Error, Item, ItemOutcome, UnavailableItem, retry_after};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use std::time::Duration;
 
     #[test]
     fn completed_item_maps_to_an_article() {
@@ -240,5 +303,18 @@ mod tests {
                 reason: "Matter returned no extracted Markdown".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn retry_after_uses_the_server_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("12"));
+
+        assert_eq!(retry_after(&headers), Duration::from_secs(12));
+    }
+
+    #[test]
+    fn retry_after_defaults_to_the_content_pacing_interval() {
+        assert_eq!(retry_after(&HeaderMap::new()), CONTENT_REQUEST_INTERVAL);
     }
 }
