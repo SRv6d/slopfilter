@@ -1,5 +1,3 @@
-use std::env;
-
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
@@ -28,6 +26,13 @@ enum Command {
 
         #[arg(long)]
         dry_run: bool,
+        #[arg(
+            long,
+            env = "MATTER_API_TOKEN",
+            hide_env_values = true,
+            value_name = "TOKEN"
+        )]
+        matter_api_token: String,
     },
 }
 
@@ -36,17 +41,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Scan { limit, dry_run } => scan(limit, dry_run).await,
+        Command::Scan {
+            limit,
+            dry_run,
+            matter_api_token,
+        } => scan(matter_api_token, limit, dry_run).await,
     }
 }
 
-async fn scan(limit: u8, dry_run: bool) -> Result<()> {
+async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     if !dry_run {
         bail!("scan currently only supports --dry-run");
     }
 
-    let token = env::var("MATTER_API_TOKEN")
-        .context("MATTER_API_TOKEN is required; generate one in Matter settings")?;
     let result = matter::Client::new(token)
         .queue_articles(limit)
         .await
