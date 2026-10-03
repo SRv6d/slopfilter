@@ -1,6 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::article::Article;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
     Client as HttpClient, StatusCode,
     header::{HeaderMap, RETRY_AFTER},
@@ -14,14 +15,15 @@ use tokio::{
 use url::Url;
 
 const API_BASE_URL: &str = "https://api.getmatter.com/public/v1";
-const CONTENT_REQUEST_INTERVAL: Duration = Duration::from_millis(3_100);
+const MAX_BURST_REQUESTS_PER_SECOND: u32 = 5;
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_RETRIES: u8 = 3;
 
 #[derive(Clone)]
 pub(crate) struct Client {
     http: HttpClient,
     token: String,
-    content_limiter: Arc<ContentRateLimiter>,
+    content_gate: Arc<ContentRequestGate>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,31 +54,37 @@ pub(crate) enum ItemOutcome {
     Unavailable(UnavailableItem),
 }
 
-struct ContentRateLimiter {
-    next_request: Mutex<Instant>,
+struct ContentRequestGate {
+    burst_limiter: DefaultDirectRateLimiter,
+    deferred_until: Mutex<Instant>,
 }
 
-impl ContentRateLimiter {
+impl ContentRequestGate {
     fn new() -> Self {
         Self {
-            next_request: Mutex::new(Instant::now()),
+            burst_limiter: RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(MAX_BURST_REQUESTS_PER_SECOND)
+                    .expect("the Matter burst limit is nonzero"),
+            )),
+            deferred_until: Mutex::new(Instant::now()),
         }
     }
 
     async fn acquire(&self) {
-        let request_at = {
-            let mut next_request = self.next_request.lock().await;
-            let request_at = (*next_request).max(Instant::now());
-            *next_request = request_at + CONTENT_REQUEST_INTERVAL;
-            request_at
-        };
+        loop {
+            let deferred_until = *self.deferred_until.lock().await;
+            sleep_until(deferred_until.max(Instant::now())).await;
+            self.burst_limiter.until_ready().await;
 
-        sleep_until(request_at).await;
+            if *self.deferred_until.lock().await <= Instant::now() {
+                return;
+            }
+        }
     }
 
     async fn defer(&self, delay: Duration) {
-        let mut next_request = self.next_request.lock().await;
-        *next_request = (*next_request).max(Instant::now() + delay);
+        let mut deferred_until = self.deferred_until.lock().await;
+        *deferred_until = (*deferred_until).max(Instant::now() + delay);
     }
 }
 
@@ -85,7 +93,7 @@ impl Client {
         Self {
             http: HttpClient::new(),
             token,
-            content_limiter: Arc::new(ContentRateLimiter::new()),
+            content_gate: Arc::new(ContentRequestGate::new()),
         }
     }
 
@@ -115,7 +123,7 @@ impl Client {
 
     async fn item(&self, id: &str) -> Result<Item, Error> {
         for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-            self.content_limiter.acquire().await;
+            self.content_gate.acquire().await;
 
             let response = self
                 .http
@@ -126,7 +134,7 @@ impl Client {
                 .await?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                self.content_limiter
+                self.content_gate
                     .defer(retry_after(response.headers()))
                     .await;
 
@@ -154,7 +162,7 @@ fn retry_after(headers: &HeaderMap) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(CONTENT_REQUEST_INTERVAL)
+        .unwrap_or(DEFAULT_RETRY_AFTER)
 }
 
 #[derive(Deserialize)]
@@ -215,7 +223,7 @@ impl Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTENT_REQUEST_INTERVAL, Error, Item, ItemOutcome, UnavailableItem, retry_after};
+    use super::{DEFAULT_RETRY_AFTER, Error, Item, ItemOutcome, UnavailableItem, retry_after};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
 
@@ -314,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_defaults_to_the_content_pacing_interval() {
-        assert_eq!(retry_after(&HeaderMap::new()), CONTENT_REQUEST_INTERVAL);
+    fn retry_after_defaults_to_the_documented_fallback() {
+        assert_eq!(retry_after(&HeaderMap::new()), DEFAULT_RETRY_AFTER);
     }
 }
