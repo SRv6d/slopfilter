@@ -45,7 +45,7 @@
               rustToolchain
               pkgs.git
               pkgs.gh
-              pkgs.nixfmt-rfc-style
+              pkgs.nixfmt
             ];
           };
         }
