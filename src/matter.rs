@@ -1,6 +1,7 @@
 use crate::article::Article;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
+use url::Url;
 
 const API_BASE_URL: &str = "https://api.getmatter.com/public/v1";
 
@@ -107,6 +108,16 @@ impl Item {
             });
         }
 
+        let url = match Url::parse(&url) {
+            Ok(url) => url,
+            Err(_) => {
+                return Err(SkippedItem {
+                    id,
+                    reason: "Matter returned an invalid URL".to_owned(),
+                });
+            }
+        };
+
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
             return Err(SkippedItem {
                 id,
@@ -144,7 +155,31 @@ mod tests {
 
         assert_eq!(article.source_id, "itm_123");
         assert_eq!(article.title, "A saved article");
+        assert_eq!(article.url.as_str(), "https://example.com/article");
+
         assert_eq!(article.word_count(), 4);
+    }
+
+    #[test]
+    fn item_with_an_invalid_url_is_skipped() {
+        let item: Item = serde_json::from_str(
+            r#"{
+                "id": "itm_123",
+                "title": "A saved article",
+                "url": "not a URL",
+                "processing_status": "completed",
+                "markdown": "Article body"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            item.into_article().unwrap_err(),
+            super::SkippedItem {
+                id: "itm_123".to_owned(),
+                reason: "Matter returned an invalid URL".to_owned(),
+            }
+        );
     }
 
     #[test]
