@@ -5,3 +5,9 @@ pub struct Article {
     pub url: String,
     pub markdown: String,
 }
+
+impl Article {
+    pub fn word_count(&self) -> usize {
+        self.markdown.split_whitespace().count()
+    }
+}
