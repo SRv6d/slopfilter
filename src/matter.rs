@@ -1,3 +1,4 @@
+//! Matter source adapter for the Items API.
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::article::Article;

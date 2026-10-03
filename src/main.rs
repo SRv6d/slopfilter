@@ -1,3 +1,4 @@
+//! Command-line entrypoint for scanning Matter articles.
 use std::{
     env,
     io::{self, IsTerminal},

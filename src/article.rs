@@ -1,3 +1,4 @@
+//! Source-independent article data passed between pipeline stages.
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
