@@ -22,22 +22,28 @@
         "x86_64-linux"
       ];
       forEachSystem = nixpkgs.lib.genAttrs supportedSystems;
+      mkPkgs =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
+      mkRustToolchain =
+        pkgs:
+        pkgs.rust-bin.stable.latest.default.override {
+          extensions = [
+            "clippy"
+            "rust-analyzer"
+            "rustfmt"
+          ];
+        };
     in
     {
       devShells = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ (import rust-overlay) ];
-          };
-          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "clippy"
-              "rust-analyzer"
-              "rustfmt"
-            ];
-          };
+          pkgs = mkPkgs system;
+          rustToolchain = mkRustToolchain pkgs;
         in
         {
           default = pkgs.mkShell {
@@ -50,5 +56,9 @@
           };
         }
       );
+
+      packages = forEachSystem (system: {
+        rust-toolchain = mkRustToolchain (mkPkgs system);
+      });
     };
 }
