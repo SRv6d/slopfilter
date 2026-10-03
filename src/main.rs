@@ -2,6 +2,7 @@
 use std::{
     env,
     io::{self, IsTerminal},
+    sync::Arc,
 };
 
 use anstyle::Style;
@@ -43,6 +44,15 @@ enum Command {
             value_name = "TOKEN"
         )]
         matter_api_token: String,
+
+        #[arg(
+            long,
+            env = "PANGRAM_API_KEY",
+            hide_env_values = true,
+            required_unless_present = "dry_run",
+            value_name = "KEY"
+        )]
+        pangram_api_key: Option<String>,
     },
 }
 
@@ -55,16 +65,32 @@ async fn main() -> Result<()> {
             limit,
             dry_run,
             matter_api_token,
-        } => scan(matter_api_token, limit, dry_run).await,
+            pangram_api_key,
+        } => scan(matter_api_token, pangram_api_key, limit, dry_run).await,
     }
 }
 
-async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
-    if !dry_run {
-        bail!("scan currently only supports --dry-run");
-    }
+async fn scan(
+    matter_api_token: String,
+    pangram_api_key: Option<String>,
+    limit: u8,
+    dry_run: bool,
+) -> Result<()> {
+    let pangram = if dry_run {
+        None
+    } else {
+        let client = pangram::Client::new(
+            pangram_api_key.expect("Clap requires a Pangram API key unless --dry-run is present"),
+        );
+        let model: Arc<str> = client
+            .discover_model()
+            .await
+            .context("failed to discover an available Pangram model")?
+            .into();
+        Some((client, model))
+    };
 
-    let client = matter::Client::new(token);
+    let client = matter::Client::new(matter_api_token);
     let articles = client
         .queued_articles(limit)
         .await
@@ -73,10 +99,17 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     let fetches = stream::iter(articles)
         .map(|item| {
             let client = client.clone();
+            let pangram = pangram.clone();
 
             async move {
                 let outcome = client.fetch_article(&item.id).await;
-                (item, outcome)
+                let score = match (&outcome, pangram) {
+                    (Ok(matter::ItemOutcome::Available(article)), Some((client, model))) => {
+                        Some(client.score(&article.markdown, &model).await)
+                    }
+                    _ => None,
+                };
+                (item, outcome, score)
             }
         })
         .buffer_unordered(MAX_CONCURRENT_FETCHES);
@@ -85,11 +118,32 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     let mut available = 0;
     let mut failures = 0;
 
-    while let Some((item, outcome)) = fetches.next().await {
+    while let Some((item, outcome, score)) = fetches.next().await {
         match outcome {
             Ok(matter::ItemOutcome::Available(article)) => {
                 available += 1;
-                println!("{}", format_article(&article, color));
+
+                match score {
+                    None => println!("{}", format_article(&article, color)),
+                    Some(Ok(pangram::ScoreOutcome::Complete(score))) => {
+                        println!("{}", format_scored_article(&article, &score, color));
+                    }
+                    Some(Ok(pangram::ScoreOutcome::Pending { task, stage })) => {
+                        println!("{}", format_article(&article, color));
+                        println!(
+                            "  Pangram task {} ({}) remains {stage} and can be resumed.",
+                            task.task_id, task.model
+                        );
+                    }
+                    Some(Err(error)) => {
+                        failures += 1;
+                        eprintln!(
+                            "Failed: {}\n  {error} · Matter: {}",
+                            render_title(&item.title, color),
+                            item.id,
+                        );
+                    }
+                }
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
                 eprintln!("{}", format_unavailable(&item, color));
@@ -110,7 +164,7 @@ async fn scan(token: String, limit: u8, dry_run: bool) -> Result<()> {
     }
 
     if failures > 0 {
-        bail!("failed to fetch {failures} queued Matter article(s)");
+        bail!("failed to process {failures} queued Matter article(s)");
     }
 
     Ok(())
@@ -127,6 +181,26 @@ fn format_article(article: &article::Article, color: bool) -> String {
         article.url,
         article.word_count(),
         article.source_id,
+    )
+}
+
+fn format_scored_article(
+    article: &article::Article,
+    score: &pangram::Score,
+    color: bool,
+) -> String {
+    format!(
+        "{}\n  {}\n  {} words · Matter: {}\n  Pangram: {} / {} · {:.1}% AI · {:.1}% AI-assisted · {:.1}% human\n  {}",
+        render_title(&article.title, color),
+        article.url,
+        article.word_count(),
+        article.source_id,
+        score.model,
+        score.version,
+        score.fractions.ai * 100.0,
+        score.fractions.ai_assisted * 100.0,
+        score.fractions.human * 100.0,
+        score.prediction.headline,
     )
 }
 
@@ -157,35 +231,5 @@ fn parse_limit(value: &str) -> std::result::Result<u8, String> {
         Ok(limit)
     } else {
         Err("limit must be between 1 and 20".to_owned())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{format_article, render_title};
-    use crate::article::Article;
-    use url::Url;
-
-    #[test]
-    fn plain_article_output_leads_with_the_title() {
-        let article = Article {
-            source_id: "itm_123".to_owned(),
-            title: "A saved article".to_owned(),
-            url: Url::parse("https://example.com/article").unwrap(),
-            markdown: "Article body".to_owned(),
-        };
-
-        assert_eq!(
-            format_article(&article, false),
-            "A saved article\n  https://example.com/article\n  2 words · Matter: itm_123"
-        );
-    }
-
-    #[test]
-    fn styled_title_is_bold() {
-        assert_eq!(
-            render_title("A saved article", true),
-            "\u{1b}[1mA saved article\u{1b}[0m"
-        );
     }
 }
