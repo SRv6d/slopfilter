@@ -35,6 +35,7 @@
             "clippy"
             "rust-analyzer"
             "rustfmt"
+            "rust-src"
           ];
         };
     in
