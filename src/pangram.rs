@@ -21,14 +21,30 @@ pub(crate) struct Client {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error("Pangram API request failed")]
+    #[error("Pangram API request failed: {0}")]
     Request(#[from] reqwest::Error),
 
-    #[error("Pangram API request failed while polling task {}", task.task_id)]
+    #[error("Pangram API returned HTTP {status}: {message}")]
+    ApiResponse {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+
+    #[error("Pangram API request failed while polling task {}: {source}", task.task_id)]
     PollRequest {
         task: TaskHandle,
         #[source]
         source: reqwest::Error,
+    },
+
+    #[error(
+        "Pangram API returned HTTP {status} while polling task {}: {message}",
+        task.task_id
+    )]
+    PollApiResponse {
+        task: TaskHandle,
+        status: reqwest::StatusCode,
+        message: String,
     },
 
     #[error("Pangram returned no available models")]
@@ -163,16 +179,14 @@ impl Client {
     }
 
     pub(crate) async fn discover_model(&self) -> Result<String, Error> {
-        let response: ModelsResponse = self
+        let response = self
             .http
             .get(self.endpoint("models"))
             .timeout(REQUEST_TIMEOUT)
             .header(API_KEY_HEADER, self.api_key.as_ref())
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let response: ModelsResponse = require_success(response).await?.json().await?;
 
         let model = response
             .models
@@ -199,7 +213,7 @@ impl Client {
     }
 
     async fn submit(&self, text: &str, model: &str) -> Result<TaskHandle, Error> {
-        let response: SubmitResponse = self
+        let response = self
             .http
             .post(self.endpoint("task"))
             .timeout(REQUEST_TIMEOUT)
@@ -210,10 +224,8 @@ impl Client {
                 public_dashboard_link: false,
             })
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let response: SubmitResponse = require_success(response).await?.json().await?;
 
         if response.task_id.is_empty() {
             return Err(Error::InvalidResponse(
@@ -245,18 +257,20 @@ impl Client {
     }
 
     async fn poll(&self, task: &TaskHandle) -> Result<ControlFlow<Score, TaskStage>, Error> {
-        let response: TaskResponse = self
+        let response = self
             .http
             .get(self.task_endpoint(&task.task_id))
             .timeout(REQUEST_TIMEOUT)
             .header(API_KEY_HEADER, self.api_key.as_ref())
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
             .map_err(|source| Error::PollRequest {
                 task: task.clone(),
                 source,
-            })?
+            })?;
+        let response: TaskResponse = require_success(response)
+            .await
+            .map_err(|error| error.with_task(task))?
             .json()
             .await
             .map_err(|source| Error::PollRequest {
@@ -281,6 +295,38 @@ impl Client {
             .push(task_id);
         endpoint
     }
+}
+
+impl Error {
+    fn with_task(self, task: &TaskHandle) -> Self {
+        match self {
+            Self::Request(source) => Self::PollRequest {
+                task: task.clone(),
+                source,
+            },
+            Self::ApiResponse { status, message } => Self::PollApiResponse {
+                task: task.clone(),
+                status,
+                message,
+            },
+            error => error,
+        }
+    }
+}
+
+async fn require_success(response: reqwest::Response) -> Result<reqwest::Response, Error> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = response.text().await?;
+    let message = match body.trim() {
+        "" => "empty response body".to_owned(),
+        body => body.to_owned(),
+    };
+
+    Err(Error::ApiResponse { status, message })
 }
 
 impl TaskResponse {
@@ -415,6 +461,44 @@ mod tests {
         assert_eq!(score.prediction.short, "Human");
     }
 
+    #[tokio::test]
+    async fn rejected_submission_includes_status_and_response_body() {
+        let (base_url, server) = rejected_submission_server();
+        let client = Client {
+            http: reqwest::Client::new(),
+            api_key: Arc::from("secret-key"),
+            base_url,
+        };
+
+        let model = client.discover_model().await.unwrap();
+        let error = client.score("# An article", &model).await.unwrap_err();
+        server.join().unwrap();
+        let message = error.to_string();
+
+        assert!(message.contains("HTTP 422"));
+        assert!(message.contains("requested model is not enabled"));
+    }
+
+    fn rejected_submission_server() -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("GET /models HTTP/1.1"));
+            write_response(&mut stream, r#"{"models":["pangram-4"]}"#);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("POST /task HTTP/1.1"));
+            write_status_response(
+                &mut stream,
+                "422 Unprocessable Entity",
+                r#"{"detail":"requested model is not enabled"}"#,
+            );
+        });
+
+        (base_url, server)
+    }
+
     fn lifecycle_server() -> (Url, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
@@ -500,9 +584,13 @@ mod tests {
     }
 
     fn write_response(stream: &mut TcpStream, body: &str) {
+        write_status_response(stream, "200 OK", body);
+    }
+
+    fn write_status_response(stream: &mut TcpStream, status: &str, body: &str) {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
