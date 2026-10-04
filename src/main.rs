@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{StreamExt, pin_mut, stream};
 
 pub mod article;
+pub mod article_set;
 pub mod matter;
 pub mod pangram;
 pub mod store;
@@ -58,6 +59,12 @@ enum ListSource {
             value_name = "TOKEN"
         )]
         matter_api_token: String,
+
+        #[arg(long, value_name = "PATH", help = "Save a portable article set")]
+        save: Option<PathBuf>,
+
+        #[arg(long, requires = "save", help = "Replace an existing article-set file")]
+        force: bool,
     },
 }
 
@@ -102,17 +109,33 @@ enum ScoreSource {
         score: ScoreOptions,
     },
 
-    /// Score a UTF-8 text or Markdown file.
     File {
-        #[arg(value_name = "PATH", help = "UTF-8 text or Markdown file")]
+        #[arg(
+            value_name = "PATH",
+            help = "UTF-8 text, Markdown, or article-set file"
+        )]
         path: PathBuf,
+
+        #[arg(
+            long,
+            value_name = "ITEM_ID",
+            help = "Item to select from an article set"
+        )]
+        item: Option<String>,
 
         #[command(flatten)]
         score: ScoreOptions,
     },
 
-    /// Score UTF-8 text piped on standard input.
+    /// Score UTF-8 text or an article set piped on standard input.
     Stdin {
+        #[arg(
+            long,
+            value_name = "ITEM_ID",
+            help = "Item to select from an article set"
+        )]
+        item: Option<String>,
+
         #[command(flatten)]
         score: ScoreOptions,
     },
@@ -120,6 +143,7 @@ enum ScoreSource {
 
 enum ScoreDocument {
     Matter(article::Article),
+    ArticleSet(article_set::StoredArticle),
     File { path: PathBuf, text: String },
     Stdin { text: String },
 }
@@ -128,6 +152,7 @@ impl ScoreDocument {
     fn text(&self) -> &str {
         match self {
             Self::Matter(article) => &article.markdown,
+            Self::ArticleSet(article) => &article.markdown,
             Self::File { text, .. } | Self::Stdin { text } => text,
         }
     }
@@ -141,6 +166,7 @@ impl std::fmt::Display for ScoreDocument {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Matter(article) => write!(formatter, "Matter item {}", article.source_id),
+            Self::ArticleSet(article) => write!(formatter, "article-set item {}", article.id),
             Self::File { path, .. } => write!(formatter, "file {}", path.display()),
             Self::Stdin { .. } => formatter.write_str("standard input"),
         }
@@ -157,8 +183,10 @@ async fn main() -> Result<()> {
                 ListSource::Matter {
                     limit,
                     matter_api_token,
+                    save,
+                    force,
                 },
-        } => list_matter(matter_api_token, limit).await,
+        } => list_matter(matter_api_token, limit, save, force).await,
         Command::Score {
             source:
                 ScoreSource::Matter {
@@ -168,20 +196,26 @@ async fn main() -> Result<()> {
                 },
         } => score_matter(matter_api_token, item_id, score).await,
         Command::Score {
-            source: ScoreSource::File { path, score },
-        } => score_file(path, score).await,
+            source: ScoreSource::File { path, item, score },
+        } => score_file(path, item, score).await,
         Command::Score {
-            source: ScoreSource::Stdin { score },
-        } => score_stdin(score).await,
+            source: ScoreSource::Stdin { item, score },
+        } => score_stdin(item, score).await,
     }
 }
 
-async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
+async fn list_matter(
+    matter_api_token: String,
+    limit: u8,
+    save: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
     let client = matter::Client::new(matter_api_token);
     let articles = client
         .queued_articles(limit)
         .await
         .context("failed to list queued Matter articles")?;
+    let mut stored_articles = save.as_ref().map(|_| Vec::with_capacity(articles.len()));
     let color = color_enabled();
     let fetches = stream::iter(articles)
         .map(|item| {
@@ -206,6 +240,12 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
                 let word_count = article.word_count();
                 total_words += word_count;
                 println!("{}", format_article(&article, word_count, color));
+
+                if let Some(articles) = &mut stored_articles {
+                    articles.push(article_set::StoredArticle::from_article(
+                        article, word_count,
+                    ));
+                }
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
                 eprintln!("{}", format_unavailable(&item, color));
@@ -232,6 +272,12 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
         bail!("failed to fetch {failures} queued Matter article(s)");
     }
 
+    if let (Some(path), Some(articles)) = (save, stored_articles) {
+        let article_set = article_set::ArticleSet::matter(articles);
+        article_set::write(&path, &article_set, force)?;
+        println!("Saved article set to {}.", path.display());
+    }
+
     Ok(())
 }
 
@@ -255,14 +301,15 @@ async fn score_matter(
     score_document(ScoreDocument::Matter(article), score).await
 }
 
-async fn score_file(path: PathBuf, score: ScoreOptions) -> Result<()> {
+async fn score_file(path: PathBuf, item: Option<String>, score: ScoreOptions) -> Result<()> {
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
+    let document = decode_score_input(text, item, Some(path))?;
 
-    score_document(ScoreDocument::File { path, text }, score).await
+    score_document(document, score).await
 }
 
-async fn score_stdin(score: ScoreOptions) -> Result<()> {
+async fn score_stdin(item: Option<String>, score: ScoreOptions) -> Result<()> {
     if io::stdin().is_terminal() {
         bail!("no piped input; pass text on standard input");
     }
@@ -271,8 +318,30 @@ async fn score_stdin(score: ScoreOptions) -> Result<()> {
     io::stdin()
         .read_to_string(&mut text)
         .context("failed to read UTF-8 text from standard input")?;
+    let document = decode_score_input(text, item, None)?;
 
-    score_document(ScoreDocument::Stdin { text }, score).await
+    score_document(document, score).await
+}
+
+fn decode_score_input(
+    text: String,
+    item: Option<String>,
+    path: Option<PathBuf>,
+) -> Result<ScoreDocument> {
+    if let Some(article_set) = article_set::ArticleSet::parse(&text)? {
+        let item =
+            item.ok_or_else(|| anyhow::anyhow!("article-set input requires --item <ITEM_ID>"))?;
+        return Ok(ScoreDocument::ArticleSet(article_set.select(&item)?));
+    }
+
+    if item.is_some() {
+        bail!("--item is only valid for article-set input");
+    }
+
+    Ok(match path {
+        Some(path) => ScoreDocument::File { path, text },
+        None => ScoreDocument::Stdin { text },
+    })
 }
 
 async fn score_document(document: ScoreDocument, score: ScoreOptions) -> Result<()> {
@@ -340,6 +409,12 @@ fn format_article(article: &article::Article, word_count: usize, color: bool) ->
 fn format_document(document: &ScoreDocument, word_count: usize, color: bool) -> String {
     match document {
         ScoreDocument::Matter(article) => format_article(article, word_count, color),
+        ScoreDocument::ArticleSet(article) => format!(
+            "{}\n  {}\n  {word_count} words · Article set: {}",
+            render_title(&article.title, color),
+            article.url,
+            article.id,
+        ),
         ScoreDocument::File { path, .. } => format!(
             "{}\n  {word_count} words · File",
             render_title(&path.display().to_string(), color)
