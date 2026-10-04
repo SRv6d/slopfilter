@@ -4,7 +4,7 @@
 
 ## Usage
 
-Set `MATTER_API_TOKEN`, then inspect queued articles without contacting Pangram:
+Set `MATTER_API_TOKEN`, then inspect queued articles and their total word count without contacting Pangram:
 
 ```console
 $ slopfilter list matter --limit 20

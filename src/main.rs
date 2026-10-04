@@ -139,13 +139,16 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
     pin_mut!(fetches);
 
     let mut available = 0;
+    let mut total_words = 0;
     let mut failures = 0;
 
     while let Some((item, outcome)) = fetches.next().await {
         match outcome {
             Ok(matter::ItemOutcome::Available(article)) => {
                 available += 1;
-                println!("{}", format_article(&article, color));
+                let word_count = article.word_count();
+                total_words += word_count;
+                println!("{}", format_article(&article, word_count, color));
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
                 eprintln!("{}", format_unavailable(&item, color));
@@ -161,9 +164,12 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
         }
     }
 
-    if available == 0 {
-        println!("No eligible articles found.");
-    }
+    let noun = if available == 1 {
+        "article"
+    } else {
+        "articles"
+    };
+    println!("Total: {total_words} words across {available} eligible {noun}.");
 
     if failures > 0 {
         bail!("failed to fetch {failures} queued Matter article(s)");
@@ -189,7 +195,7 @@ async fn score_matter(
             bail!("Matter item {} cannot be scored: {}", item.id, item.reason);
         }
     };
-    enforce_word_limit(&article, max_words)?;
+    let word_count = enforce_word_limit(&article, max_words)?;
 
     let pangram_client = pangram::Client::new(pangram_api_key);
     let model = pangram_client
@@ -204,10 +210,13 @@ async fn score_matter(
 
     match outcome {
         pangram::ScoreOutcome::Complete(score) => {
-            println!("{}", format_scored_article(&article, &score, color));
+            println!(
+                "{}",
+                format_scored_article(&article, word_count, &score, color)
+            );
         }
         pangram::ScoreOutcome::Pending { task, stage } => {
-            println!("{}", format_article(&article, color));
+            println!("{}", format_article(&article, word_count, color));
             println!(
                 "  Pangram task {} ({}) remains {stage} and can be resumed.",
                 task.task_id, task.model
@@ -218,7 +227,7 @@ async fn score_matter(
     Ok(())
 }
 
-fn enforce_word_limit(article: &article::Article, max_words: usize) -> Result<()> {
+fn enforce_word_limit(article: &article::Article, max_words: usize) -> Result<usize> {
     let word_count = article.word_count();
     if word_count > max_words {
         bail!(
@@ -228,33 +237,32 @@ fn enforce_word_limit(article: &article::Article, max_words: usize) -> Result<()
         );
     }
 
-    Ok(())
+    Ok(word_count)
 }
 
 fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
-fn format_article(article: &article::Article, color: bool) -> String {
+fn format_article(article: &article::Article, word_count: usize, color: bool) -> String {
     format!(
-        "{}\n  {}\n  {} words · Matter: {}",
+        "{}\n  {}\n  {word_count} words · Matter: {}",
         render_title(&article.title, color),
         article.url,
-        article.word_count(),
         article.source_id,
     )
 }
 
 fn format_scored_article(
     article: &article::Article,
+    word_count: usize,
     score: &pangram::Score,
     color: bool,
 ) -> String {
     format!(
-        "{}\n  {}\n  {} words · Matter: {}\n  Pangram: {} / {} · {:.1}% AI · {:.1}% AI-assisted · {:.1}% human\n  {}",
+        "{}\n  {}\n  {word_count} words · Matter: {}\n  Pangram: {} / {} · {:.1}% AI · {:.1}% AI-assisted · {:.1}% human\n  {}",
         render_title(&article.title, color),
         article.url,
-        article.word_count(),
         article.source_id,
         score.model,
         score.version,
@@ -324,6 +332,6 @@ mod tests {
 
         let error = enforce_word_limit(&article, 2_000).unwrap_err();
         assert!(error.to_string().contains("--max-words 2001"));
-        enforce_word_limit(&article, 2_001).unwrap();
+        assert_eq!(enforce_word_limit(&article, 2_001).unwrap(), 2_001);
     }
 }
