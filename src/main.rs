@@ -1,8 +1,7 @@
-//! Command-line entrypoint for scanning Matter articles.
+//! Command-line entrypoint for listing and scoring articles.
 use std::{
     env,
     io::{self, IsTerminal},
-    sync::Arc,
 };
 
 use anstyle::Style;
@@ -16,6 +15,7 @@ pub mod pangram;
 pub mod store;
 
 const MAX_CONCURRENT_FETCHES: usize = 4;
+const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "Find AI-generated articles in Matter")]
@@ -26,7 +26,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Scan {
+    /// List articles without contacting Pangram.
+    List {
+        #[command(subcommand)]
+        source: ListSource,
+    },
+
+    /// Submit one article to Pangram for billable analysis.
+    Score {
+        #[command(subcommand)]
+        source: ScoreSource,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ListSource {
+    Matter {
         #[arg(
             long,
             default_value_t = 1,
@@ -35,8 +50,33 @@ enum Command {
         )]
         limit: u8,
 
-        #[arg(long)]
-        dry_run: bool,
+        #[arg(
+            long,
+            env = "MATTER_API_TOKEN",
+            hide_env_values = true,
+            value_name = "TOKEN"
+        )]
+        matter_api_token: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScoreSource {
+    Matter {
+        #[arg(
+            value_name = "ITEM_ID",
+            help = "Matter item ID reported by `list matter`"
+        )]
+        item_id: String,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MAX_SCORE_WORDS,
+            help = "Maximum article words authorized for this submission",
+            value_parser = parse_max_words
+        )]
+        max_words: usize,
+
         #[arg(
             long,
             env = "MATTER_API_TOKEN",
@@ -49,10 +89,9 @@ enum Command {
             long,
             env = "PANGRAM_API_KEY",
             hide_env_values = true,
-            required_unless_present = "dry_run",
             value_name = "KEY"
         )]
-        pangram_api_key: Option<String>,
+        pangram_api_key: String,
     },
 }
 
@@ -61,35 +100,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Scan {
-            limit,
-            dry_run,
-            matter_api_token,
-            pangram_api_key,
-        } => scan(matter_api_token, pangram_api_key, limit, dry_run).await,
+        Command::List {
+            source:
+                ListSource::Matter {
+                    limit,
+                    matter_api_token,
+                },
+        } => list_matter(matter_api_token, limit).await,
+        Command::Score {
+            source:
+                ScoreSource::Matter {
+                    item_id,
+                    max_words,
+                    matter_api_token,
+                    pangram_api_key,
+                },
+        } => score_matter(matter_api_token, pangram_api_key, item_id, max_words).await,
     }
 }
 
-async fn scan(
-    matter_api_token: String,
-    pangram_api_key: Option<String>,
-    limit: u8,
-    dry_run: bool,
-) -> Result<()> {
-    let pangram = if dry_run {
-        None
-    } else {
-        let client = pangram::Client::new(
-            pangram_api_key.expect("Clap requires a Pangram API key unless --dry-run is present"),
-        );
-        let model: Arc<str> = client
-            .discover_model()
-            .await
-            .context("failed to discover an available Pangram model")?
-            .into();
-        Some((client, model))
-    };
-
+async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
     let client = matter::Client::new(matter_api_token);
     let articles = client
         .queued_articles(limit)
@@ -99,17 +129,10 @@ async fn scan(
     let fetches = stream::iter(articles)
         .map(|item| {
             let client = client.clone();
-            let pangram = pangram.clone();
 
             async move {
                 let outcome = client.fetch_article(&item.id).await;
-                let score = match (&outcome, pangram) {
-                    (Ok(matter::ItemOutcome::Available(article)), Some((client, model))) => {
-                        Some(client.score(&article.markdown, &model).await)
-                    }
-                    _ => None,
-                };
-                (item, outcome, score)
+                (item, outcome)
             }
         })
         .buffer_unordered(MAX_CONCURRENT_FETCHES);
@@ -118,32 +141,11 @@ async fn scan(
     let mut available = 0;
     let mut failures = 0;
 
-    while let Some((item, outcome, score)) = fetches.next().await {
+    while let Some((item, outcome)) = fetches.next().await {
         match outcome {
             Ok(matter::ItemOutcome::Available(article)) => {
                 available += 1;
-
-                match score {
-                    None => println!("{}", format_article(&article, color)),
-                    Some(Ok(pangram::ScoreOutcome::Complete(score))) => {
-                        println!("{}", format_scored_article(&article, &score, color));
-                    }
-                    Some(Ok(pangram::ScoreOutcome::Pending { task, stage })) => {
-                        println!("{}", format_article(&article, color));
-                        println!(
-                            "  Pangram task {} ({}) remains {stage} and can be resumed.",
-                            task.task_id, task.model
-                        );
-                    }
-                    Some(Err(error)) => {
-                        failures += 1;
-                        eprintln!(
-                            "Failed: {}\n  {error} · Matter: {}",
-                            render_title(&item.title, color),
-                            item.id,
-                        );
-                    }
-                }
+                println!("{}", format_article(&article, color));
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
                 eprintln!("{}", format_unavailable(&item, color));
@@ -164,7 +166,66 @@ async fn scan(
     }
 
     if failures > 0 {
-        bail!("failed to process {failures} queued Matter article(s)");
+        bail!("failed to fetch {failures} queued Matter article(s)");
+    }
+
+    Ok(())
+}
+
+async fn score_matter(
+    matter_api_token: String,
+    pangram_api_key: String,
+    item_id: String,
+    max_words: usize,
+) -> Result<()> {
+    let matter_client = matter::Client::new(matter_api_token);
+    let article = match matter_client
+        .fetch_article(&item_id)
+        .await
+        .with_context(|| format!("failed to fetch Matter item {item_id}"))?
+    {
+        matter::ItemOutcome::Available(article) => article,
+        matter::ItemOutcome::Unavailable(item) => {
+            bail!("Matter item {} cannot be scored: {}", item.id, item.reason);
+        }
+    };
+    enforce_word_limit(&article, max_words)?;
+
+    let pangram_client = pangram::Client::new(pangram_api_key);
+    let model = pangram_client
+        .discover_model()
+        .await
+        .context("failed to discover an available Pangram model")?;
+    let outcome = pangram_client
+        .score(&article.markdown, &model)
+        .await
+        .with_context(|| format!("failed to score Matter item {}", article.source_id))?;
+    let color = color_enabled();
+
+    match outcome {
+        pangram::ScoreOutcome::Complete(score) => {
+            println!("{}", format_scored_article(&article, &score, color));
+        }
+        pangram::ScoreOutcome::Pending { task, stage } => {
+            println!("{}", format_article(&article, color));
+            println!(
+                "  Pangram task {} ({}) remains {stage} and can be resumed.",
+                task.task_id, task.model
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn enforce_word_limit(article: &article::Article, max_words: usize) -> Result<()> {
+    let word_count = article.word_count();
+    if word_count > max_words {
+        bail!(
+            "refusing to score {word_count} words from Matter item {}; maximum is {max_words}. \
+             Use --max-words {word_count} to authorize this submission",
+            article.source_id
+        );
     }
 
     Ok(())
@@ -231,5 +292,38 @@ fn parse_limit(value: &str) -> std::result::Result<u8, String> {
         Ok(limit)
     } else {
         Err("limit must be between 1 and 20".to_owned())
+    }
+}
+
+fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
+    let max_words = value
+        .parse::<usize>()
+        .map_err(|_| "max words must be a positive integer".to_owned())?;
+
+    if max_words > 0 {
+        Ok(max_words)
+    } else {
+        Err("max words must be greater than zero".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enforce_word_limit;
+    use crate::article::Article;
+    use url::Url;
+
+    #[test]
+    fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
+        let article = Article {
+            source_id: "itm-123".to_owned(),
+            title: "A long article".to_owned(),
+            url: Url::parse("https://example.com/article").unwrap(),
+            markdown: "word ".repeat(2_001),
+        };
+
+        let error = enforce_word_limit(&article, 2_000).unwrap_err();
+        assert!(error.to_string().contains("--max-words 2001"));
+        enforce_word_limit(&article, 2_001).unwrap();
     }
 }
