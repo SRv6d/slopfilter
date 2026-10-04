@@ -1,12 +1,13 @@
 //! Command-line entrypoint for listing and scoring articles.
 use std::{
-    env,
-    io::{self, IsTerminal},
+    env, fs,
+    io::{self, IsTerminal, Read},
+    path::PathBuf,
 };
 
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use futures_util::{StreamExt, pin_mut, stream};
 
 pub mod article;
@@ -18,7 +19,7 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 #[derive(Debug, Parser)]
-#[command(about = "Find AI-generated articles in Matter")]
+#[command(about = "List and score text for likely AI authorship")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -32,7 +33,7 @@ enum Command {
         source: ListSource,
     },
 
-    /// Submit one article to Pangram for billable analysis.
+    /// Submit one explicit input to Pangram for billable analysis.
     Score {
         #[command(subcommand)]
         source: ScoreSource,
@@ -60,8 +61,28 @@ enum ListSource {
     },
 }
 
+#[derive(Debug, Args)]
+struct ScoreOptions {
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_SCORE_WORDS,
+        help = "Maximum input words authorized for this submission",
+        value_parser = parse_max_words
+    )]
+    max_words: usize,
+
+    #[arg(
+        long,
+        env = "PANGRAM_API_KEY",
+        hide_env_values = true,
+        value_name = "KEY"
+    )]
+    pangram_api_key: String,
+}
+
 #[derive(Debug, Subcommand)]
 enum ScoreSource {
+    /// Score a fetched Matter article.
     Matter {
         #[arg(
             value_name = "ITEM_ID",
@@ -71,28 +92,59 @@ enum ScoreSource {
 
         #[arg(
             long,
-            default_value_t = DEFAULT_MAX_SCORE_WORDS,
-            help = "Maximum article words authorized for this submission",
-            value_parser = parse_max_words
-        )]
-        max_words: usize,
-
-        #[arg(
-            long,
             env = "MATTER_API_TOKEN",
             hide_env_values = true,
             value_name = "TOKEN"
         )]
         matter_api_token: String,
 
-        #[arg(
-            long,
-            env = "PANGRAM_API_KEY",
-            hide_env_values = true,
-            value_name = "KEY"
-        )]
-        pangram_api_key: String,
+        #[command(flatten)]
+        score: ScoreOptions,
     },
+
+    /// Score a UTF-8 text or Markdown file.
+    File {
+        #[arg(value_name = "PATH", help = "UTF-8 text or Markdown file")]
+        path: PathBuf,
+
+        #[command(flatten)]
+        score: ScoreOptions,
+    },
+
+    /// Score UTF-8 text piped on standard input.
+    Stdin {
+        #[command(flatten)]
+        score: ScoreOptions,
+    },
+}
+
+enum ScoreDocument {
+    Matter(article::Article),
+    File { path: PathBuf, text: String },
+    Stdin { text: String },
+}
+
+impl ScoreDocument {
+    fn text(&self) -> &str {
+        match self {
+            Self::Matter(article) => &article.markdown,
+            Self::File { text, .. } | Self::Stdin { text } => text,
+        }
+    }
+
+    fn word_count(&self) -> usize {
+        self.text().split_whitespace().count()
+    }
+}
+
+impl std::fmt::Display for ScoreDocument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Matter(article) => write!(formatter, "Matter item {}", article.source_id),
+            Self::File { path, .. } => write!(formatter, "file {}", path.display()),
+            Self::Stdin { .. } => formatter.write_str("standard input"),
+        }
+    }
 }
 
 #[tokio::main]
@@ -111,11 +163,16 @@ async fn main() -> Result<()> {
             source:
                 ScoreSource::Matter {
                     item_id,
-                    max_words,
                     matter_api_token,
-                    pangram_api_key,
+                    score,
                 },
-        } => score_matter(matter_api_token, pangram_api_key, item_id, max_words).await,
+        } => score_matter(matter_api_token, item_id, score).await,
+        Command::Score {
+            source: ScoreSource::File { path, score },
+        } => score_file(path, score).await,
+        Command::Score {
+            source: ScoreSource::Stdin { score },
+        } => score_stdin(score).await,
     }
 }
 
@@ -180,9 +237,8 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
 
 async fn score_matter(
     matter_api_token: String,
-    pangram_api_key: String,
     item_id: String,
-    max_words: usize,
+    score: ScoreOptions,
 ) -> Result<()> {
     let matter_client = matter::Client::new(matter_api_token);
     let article = match matter_client
@@ -195,28 +251,58 @@ async fn score_matter(
             bail!("Matter item {} cannot be scored: {}", item.id, item.reason);
         }
     };
-    let word_count = enforce_word_limit(&article, max_words)?;
 
-    let pangram_client = pangram::Client::new(pangram_api_key);
+    score_document(ScoreDocument::Matter(article), score).await
+}
+
+async fn score_file(path: PathBuf, score: ScoreOptions) -> Result<()> {
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
+
+    score_document(ScoreDocument::File { path, text }, score).await
+}
+
+async fn score_stdin(score: ScoreOptions) -> Result<()> {
+    if io::stdin().is_terminal() {
+        bail!("no piped input; pass text on standard input");
+    }
+
+    let mut text = String::new();
+    io::stdin()
+        .read_to_string(&mut text)
+        .context("failed to read UTF-8 text from standard input")?;
+
+    score_document(ScoreDocument::Stdin { text }, score).await
+}
+
+async fn score_document(document: ScoreDocument, score: ScoreOptions) -> Result<()> {
+    if document.text().trim().is_empty() {
+        bail!("{document} contains no text");
+    }
+
+    let word_count = document.word_count();
+    enforce_word_limit(&document, word_count, score.max_words)?;
+
+    let pangram_client = pangram::Client::new(score.pangram_api_key);
     let model = pangram_client
         .discover_model()
         .await
         .context("failed to discover an available Pangram model")?;
     let outcome = pangram_client
-        .score(&article.markdown, &model)
+        .score(document.text(), &model)
         .await
-        .with_context(|| format!("failed to score Matter item {}", article.source_id))?;
+        .with_context(|| format!("failed to score {document}"))?;
     let color = color_enabled();
 
     match outcome {
         pangram::ScoreOutcome::Complete(score) => {
             println!(
                 "{}",
-                format_scored_article(&article, word_count, &score, color)
+                format_scored_document(&document, word_count, &score, color)
             );
         }
         pangram::ScoreOutcome::Pending { task, stage } => {
-            println!("{}", format_article(&article, word_count, color));
+            println!("{}", format_document(&document, word_count, color));
             println!(
                 "  Pangram task {} ({}) remains {stage} and can be resumed.",
                 task.task_id, task.model
@@ -227,17 +313,15 @@ async fn score_matter(
     Ok(())
 }
 
-fn enforce_word_limit(article: &article::Article, max_words: usize) -> Result<usize> {
-    let word_count = article.word_count();
+fn enforce_word_limit(document: &ScoreDocument, word_count: usize, max_words: usize) -> Result<()> {
     if word_count > max_words {
         bail!(
-            "refusing to score {word_count} words from Matter item {}; maximum is {max_words}. \
-             Use --max-words {word_count} to authorize this submission",
-            article.source_id
+            "refusing to score {word_count} words from {document}; maximum is {max_words}. \
+             Use --max-words {word_count} to authorize this submission"
         );
     }
 
-    Ok(word_count)
+    Ok(())
 }
 
 fn color_enabled() -> bool {
@@ -253,17 +337,32 @@ fn format_article(article: &article::Article, word_count: usize, color: bool) ->
     )
 }
 
-fn format_scored_article(
-    article: &article::Article,
+fn format_document(document: &ScoreDocument, word_count: usize, color: bool) -> String {
+    match document {
+        ScoreDocument::Matter(article) => format_article(article, word_count, color),
+        ScoreDocument::File { path, .. } => format!(
+            "{}\n  {word_count} words · File",
+            render_title(&path.display().to_string(), color)
+        ),
+        ScoreDocument::Stdin { .. } => format!(
+            "{}\n  {word_count} words",
+            render_title("Standard input", color)
+        ),
+    }
+}
+
+fn format_scored_document(
+    document: &ScoreDocument,
     word_count: usize,
     score: &pangram::Score,
     color: bool,
 ) -> String {
-    format!(
-        "{}\n  {}\n  {word_count} words · Matter: {}\n  Pangram: {} / {} · {:.1}% AI · {:.1}% AI-assisted · {:.1}% human\n  {}",
-        render_title(&article.title, color),
-        article.url,
-        article.source_id,
+    use std::fmt::Write as _;
+
+    let mut output = format_document(document, word_count, color);
+    write!(
+        output,
+        "\n  Pangram: {} / {} · {:.1}% AI · {:.1}% AI-assisted · {:.1}% human\n  {}",
         score.model,
         score.version,
         score.fractions.ai * 100.0,
@@ -271,6 +370,8 @@ fn format_scored_article(
         score.fractions.human * 100.0,
         score.prediction.headline,
     )
+    .expect("writing to a String cannot fail");
+    output
 }
 
 fn format_unavailable(item: &matter::UnavailableItem, color: bool) -> String {
@@ -317,21 +418,17 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::enforce_word_limit;
-    use crate::article::Article;
-    use url::Url;
+    use super::{ScoreDocument, enforce_word_limit};
 
     #[test]
     fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
-        let article = Article {
-            source_id: "itm-123".to_owned(),
-            title: "A long article".to_owned(),
-            url: Url::parse("https://example.com/article").unwrap(),
-            markdown: "word ".repeat(2_001),
+        let document = ScoreDocument::Stdin {
+            text: "word ".repeat(2_001),
         };
+        let word_count = document.word_count();
 
-        let error = enforce_word_limit(&article, 2_000).unwrap_err();
+        let error = enforce_word_limit(&document, word_count, 2_000).unwrap_err();
         assert!(error.to_string().contains("--max-words 2001"));
-        assert_eq!(enforce_word_limit(&article, 2_001).unwrap(), 2_001);
+        enforce_word_limit(&document, word_count, 2_001).unwrap();
     }
 }
