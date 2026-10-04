@@ -29,6 +29,15 @@ struct Cli {
 enum Command {
     /// List articles without contacting Pangram.
     List {
+        #[arg(
+            long,
+            global = true,
+            default_value_t = 1,
+            help = "Maximum items to inspect (1-20)",
+            value_parser = parse_limit
+        )]
+        limit: u8,
+
         #[command(subcommand)]
         source: ListSource,
     },
@@ -43,14 +52,6 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ListSource {
     Matter {
-        #[arg(
-            long,
-            default_value_t = 1,
-            help = "Maximum items to inspect (1-20)",
-            value_parser = parse_limit
-        )]
-        limit: u8,
-
         #[arg(
             long,
             env = "MATTER_API_TOKEN",
@@ -153,11 +154,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::List {
-            source:
-                ListSource::Matter {
-                    limit,
-                    matter_api_token,
-                },
+            limit,
+            source: ListSource::Matter { matter_api_token },
         } => list_matter(matter_api_token, limit).await,
         Command::Score {
             source:
@@ -418,7 +416,43 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScoreDocument, enforce_word_limit};
+    use super::{Cli, Command, ListSource, ScoreDocument, enforce_word_limit};
+    use clap::Parser;
+
+    #[test]
+    fn list_limit_can_precede_or_follow_the_provider() {
+        for arguments in [
+            [
+                "slopfilter",
+                "list",
+                "--limit",
+                "7",
+                "matter",
+                "--matter-api-token",
+                "token",
+            ],
+            [
+                "slopfilter",
+                "list",
+                "matter",
+                "--limit",
+                "7",
+                "--matter-api-token",
+                "token",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Command::List {
+                limit,
+                source: ListSource::Matter { .. },
+            } = cli.command
+            else {
+                panic!("expected the Matter list command");
+            };
+
+            assert_eq!(limit, 7);
+        }
+    }
 
     #[test]
     fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
