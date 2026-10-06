@@ -1,4 +1,4 @@
-//! Command-line entrypoint for listing and scoring articles.
+//! Command-line entrypoint for inspecting and scoring articles.
 use std::{
     env, fs,
     io::{self, IsTerminal, Read},
@@ -19,7 +19,7 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 #[derive(Debug, Parser)]
-#[command(about = "List and score text for likely AI authorship")]
+#[command(about = "Inspect and score text for likely AI authorship")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,38 +27,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List articles without contacting Pangram.
-    List {
+    /// Inspect or submit inputs to Pangram for billable analysis.
+    Score {
         #[arg(
             long,
             global = true,
-            default_value_t = 1,
-            help = "Maximum items to inspect (1-20)",
+            value_name = "COUNT",
+            help = "Maximum source items to process (1-20)",
             value_parser = parse_limit
         )]
-        limit: u8,
+        limit: Option<u8>,
+
+        #[command(flatten)]
+        score: ScoreOptions,
 
         #[command(subcommand)]
-        source: ListSource,
-    },
-
-    /// Submit one explicit input to Pangram for billable analysis.
-    Score {
-        #[command(subcommand)]
-        source: ScoreSource,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ListSource {
-    Matter {
-        #[arg(
-            long,
-            env = "MATTER_API_TOKEN",
-            hide_env_values = true,
-            value_name = "TOKEN"
-        )]
-        matter_api_token: String,
+        input: ScoreInput,
     },
 }
 
@@ -66,31 +50,44 @@ enum ListSource {
 struct ScoreOptions {
     #[arg(
         long,
+        global = true,
         default_value_t = DEFAULT_MAX_SCORE_WORDS,
-        help = "Maximum input words authorized for this submission",
+        help = "Maximum words authorized per submission",
         value_parser = parse_max_words
     )]
     max_words: usize,
 
     #[arg(
         long,
+        global = true,
+        help = "Inspect inputs without contacting Pangram"
+    )]
+    dry_run: bool,
+
+    #[arg(
+        long,
+        global = true,
         env = "PANGRAM_API_KEY",
         hide_env_values = true,
         value_name = "KEY"
     )]
-    pangram_api_key: String,
+    pangram_api_key: Option<String>,
+}
+
+impl ScoreOptions {
+    fn validate(&self) -> Result<()> {
+        if !self.dry_run && self.pangram_api_key.is_none() {
+            bail!("Pangram API key is required unless --dry-run is set");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]
-enum ScoreSource {
-    /// Score a fetched Matter article.
+enum ScoreInput {
+    /// Inspect or score queued Matter articles.
     Matter {
-        #[arg(
-            value_name = "ITEM_ID",
-            help = "Matter item ID reported by `list matter`"
-        )]
-        item_id: String,
-
         #[arg(
             long,
             env = "MATTER_API_TOKEN",
@@ -98,25 +95,16 @@ enum ScoreSource {
             value_name = "TOKEN"
         )]
         matter_api_token: String,
-
-        #[command(flatten)]
-        score: ScoreOptions,
     },
 
-    /// Score a UTF-8 text or Markdown file.
+    /// Inspect or score a UTF-8 text or Markdown file.
     File {
         #[arg(value_name = "PATH", help = "UTF-8 text or Markdown file")]
         path: PathBuf,
-
-        #[command(flatten)]
-        score: ScoreOptions,
     },
 
-    /// Score UTF-8 text piped on standard input.
-    Stdin {
-        #[command(flatten)]
-        score: ScoreOptions,
-    },
+    /// Inspect or score UTF-8 text piped on standard input.
+    Stdin,
 }
 
 enum ScoreDocument {
@@ -148,38 +136,87 @@ impl std::fmt::Display for ScoreDocument {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+struct PreparedDocument {
+    document: ScoreDocument,
+    word_count: usize,
+}
 
-    match cli.command {
-        Command::List {
-            limit,
-            source: ListSource::Matter { matter_api_token },
-        } => list_matter(matter_api_token, limit).await,
-        Command::Score {
-            source:
-                ScoreSource::Matter {
-                    item_id,
-                    matter_api_token,
-                    score,
-                },
-        } => score_matter(matter_api_token, item_id, score).await,
-        Command::Score {
-            source: ScoreSource::File { path, score },
-        } => score_file(path, score).await,
-        Command::Score {
-            source: ScoreSource::Stdin { score },
-        } => score_stdin(score).await,
+impl PreparedDocument {
+    fn new(document: ScoreDocument) -> Result<Self> {
+        if document.text().trim().is_empty() {
+            bail!("{document} contains no text");
+        }
+
+        let word_count = document.word_count();
+        Ok(Self {
+            document,
+            word_count,
+        })
     }
 }
 
-async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let Command::Score {
+        limit,
+        score,
+        input,
+    } = cli.command;
+    score.validate()?;
+
+    match input {
+        ScoreInput::Matter { matter_api_token } => {
+            score_matter(matter_api_token, limit.unwrap_or(1), score).await
+        }
+        ScoreInput::File { path } => {
+            reject_limit(limit)?;
+            score_file(path, score).await
+        }
+        ScoreInput::Stdin => {
+            reject_limit(limit)?;
+            score_stdin(score).await
+        }
+    }
+}
+
+fn reject_limit(limit: Option<u8>) -> Result<()> {
+    if limit.is_some() {
+        bail!("--limit is only valid for article sources");
+    }
+
+    Ok(())
+}
+
+async fn score_matter(matter_api_token: String, limit: u8, score: ScoreOptions) -> Result<()> {
+    let documents = load_matter_documents(matter_api_token, limit).await?;
+    let total_words = documents
+        .iter()
+        .map(|document| document.word_count)
+        .sum::<usize>();
+    let available = documents.len();
+
+    score_documents(&documents, score).await?;
+
+    let noun = if available == 1 {
+        "article"
+    } else {
+        "articles"
+    };
+    println!("Total: {total_words} words across {available} eligible {noun}.");
+    Ok(())
+}
+
+async fn load_matter_documents(
+    matter_api_token: String,
+    limit: u8,
+) -> Result<Vec<PreparedDocument>> {
     let client = matter::Client::new(matter_api_token);
     let articles = client
         .queued_articles(limit)
         .await
         .context("failed to list queued Matter articles")?;
+    let mut documents = Vec::with_capacity(articles.len());
     let color = color_enabled();
     let fetches = stream::iter(articles)
         .map(|item| {
@@ -193,17 +230,12 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
         .buffer_unordered(MAX_CONCURRENT_FETCHES);
     pin_mut!(fetches);
 
-    let mut available = 0;
-    let mut total_words = 0;
     let mut failures = 0;
 
     while let Some((item, outcome)) = fetches.next().await {
         match outcome {
             Ok(matter::ItemOutcome::Available(article)) => {
-                available += 1;
-                let word_count = article.word_count();
-                total_words += word_count;
-                println!("{}", format_article(&article, word_count, color));
+                documents.push(PreparedDocument::new(ScoreDocument::Matter(article))?);
             }
             Ok(matter::ItemOutcome::Unavailable(item)) => {
                 eprintln!("{}", format_unavailable(&item, color));
@@ -219,45 +251,19 @@ async fn list_matter(matter_api_token: String, limit: u8) -> Result<()> {
         }
     }
 
-    let noun = if available == 1 {
-        "article"
-    } else {
-        "articles"
-    };
-    println!("Total: {total_words} words across {available} eligible {noun}.");
-
     if failures > 0 {
         bail!("failed to fetch {failures} queued Matter article(s)");
     }
 
-    Ok(())
-}
-
-async fn score_matter(
-    matter_api_token: String,
-    item_id: String,
-    score: ScoreOptions,
-) -> Result<()> {
-    let matter_client = matter::Client::new(matter_api_token);
-    let article = match matter_client
-        .fetch_article(&item_id)
-        .await
-        .with_context(|| format!("failed to fetch Matter item {item_id}"))?
-    {
-        matter::ItemOutcome::Available(article) => article,
-        matter::ItemOutcome::Unavailable(item) => {
-            bail!("Matter item {} cannot be scored: {}", item.id, item.reason);
-        }
-    };
-
-    score_document(ScoreDocument::Matter(article), score).await
+    Ok(documents)
 }
 
 async fn score_file(path: PathBuf, score: ScoreOptions) -> Result<()> {
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
+    let document = PreparedDocument::new(ScoreDocument::File { path, text })?;
 
-    score_document(ScoreDocument::File { path, text }, score).await
+    score_documents(std::slice::from_ref(&document), score).await
 }
 
 async fn score_stdin(score: ScoreOptions) -> Result<()> {
@@ -269,42 +275,71 @@ async fn score_stdin(score: ScoreOptions) -> Result<()> {
     io::stdin()
         .read_to_string(&mut text)
         .context("failed to read UTF-8 text from standard input")?;
+    let document = PreparedDocument::new(ScoreDocument::Stdin { text })?;
 
-    score_document(ScoreDocument::Stdin { text }, score).await
+    score_documents(std::slice::from_ref(&document), score).await
 }
 
-async fn score_document(document: ScoreDocument, score: ScoreOptions) -> Result<()> {
-    if document.text().trim().is_empty() {
-        bail!("{document} contains no text");
+async fn score_documents(documents: &[PreparedDocument], score: ScoreOptions) -> Result<()> {
+    let color = color_enabled();
+    if score.dry_run {
+        for document in documents {
+            println!(
+                "{}",
+                format_document(&document.document, document.word_count, color)
+            );
+            if document.word_count > score.max_words {
+                println!(
+                    "  Pangram: dry run; would refuse above the {}-word maximum",
+                    score.max_words
+                );
+            } else {
+                println!("  Pangram: dry run; would submit");
+            }
+        }
+        return Ok(());
     }
 
-    let word_count = document.word_count();
-    enforce_word_limit(&document, word_count, score.max_words)?;
+    for document in documents {
+        enforce_word_limit(&document.document, document.word_count, score.max_words)?;
+    }
 
-    let pangram_client = pangram::Client::new(score.pangram_api_key);
+    if documents.is_empty() {
+        return Ok(());
+    }
+
+    let pangram_api_key = score
+        .pangram_api_key
+        .context("Pangram API key is required unless --dry-run is set")?;
+    let pangram_client = pangram::Client::new(pangram_api_key);
     let model = pangram_client
         .discover_model()
         .await
         .context("failed to discover an available Pangram model")?;
-    let outcome = pangram_client
-        .score(document.text(), &model)
-        .await
-        .with_context(|| format!("failed to score {document}"))?;
-    let color = color_enabled();
 
-    match outcome {
-        pangram::ScoreOutcome::Complete(score) => {
-            println!(
-                "{}",
-                format_scored_document(&document, word_count, &score, color)
-            );
-        }
-        pangram::ScoreOutcome::Pending { task, stage } => {
-            println!("{}", format_document(&document, word_count, color));
-            println!(
-                "  Pangram task {} ({}) remains {stage} and can be resumed.",
-                task.task_id, task.model
-            );
+    for document in documents {
+        let outcome = pangram_client
+            .score(document.document.text(), &model)
+            .await
+            .with_context(|| format!("failed to score {}", document.document))?;
+
+        match outcome {
+            pangram::ScoreOutcome::Complete(score) => {
+                println!(
+                    "{}",
+                    format_scored_document(&document.document, document.word_count, &score, color)
+                );
+            }
+            pangram::ScoreOutcome::Pending { task, stage } => {
+                println!(
+                    "{}",
+                    format_document(&document.document, document.word_count, color)
+                );
+                println!(
+                    "  Pangram task {} ({}) remains {stage} and can be resumed.",
+                    task.task_id, task.model
+                );
+            }
         }
     }
 
@@ -416,42 +451,67 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ListSource, ScoreDocument, enforce_word_limit};
+    use super::{
+        Cli, Command, ScoreDocument, ScoreInput, ScoreOptions, enforce_word_limit, reject_limit,
+    };
     use clap::Parser;
 
     #[test]
-    fn list_limit_can_precede_or_follow_the_provider() {
+    fn dry_run_limit_can_precede_or_follow_the_source() {
         for arguments in [
             [
                 "slopfilter",
-                "list",
+                "score",
                 "--limit",
                 "7",
+                "--dry-run",
                 "matter",
                 "--matter-api-token",
                 "token",
             ],
             [
                 "slopfilter",
-                "list",
+                "score",
                 "matter",
                 "--limit",
                 "7",
+                "--dry-run",
                 "--matter-api-token",
                 "token",
             ],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
-            let Command::List {
+            let Command::Score {
                 limit,
-                source: ListSource::Matter { .. },
+                score,
+                input: ScoreInput::Matter { .. },
             } = cli.command
             else {
-                panic!("expected the Matter list command");
+                panic!("expected the Matter score command");
             };
 
-            assert_eq!(limit, 7);
+            assert_eq!(limit, Some(7));
+            assert!(score.dry_run);
         }
+    }
+
+    #[test]
+    fn pangram_credentials_are_optional_only_for_dry_runs() {
+        let mut options = ScoreOptions {
+            max_words: 2_000,
+            dry_run: true,
+            pangram_api_key: None,
+        };
+        options.validate().unwrap();
+
+        options.dry_run = false;
+        assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn limit_is_rejected_for_non_source_inputs() {
+        reject_limit(None).unwrap();
+        assert!(reject_limit(Some(1)).is_err());
     }
 
     #[test]
