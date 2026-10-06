@@ -21,29 +21,20 @@ const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 #[derive(Debug, Parser)]
 #[command(about = "Inspect and score text for likely AI authorship")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "COUNT",
+        help = "Maximum source items to process (1-20)",
+        value_parser = parse_limit
+    )]
+    limit: Option<u8>,
+
+    #[command(flatten)]
+    score: ScoreOptions,
+
     #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Inspect or submit inputs to Pangram for billable analysis.
-    Score {
-        #[arg(
-            long,
-            global = true,
-            value_name = "COUNT",
-            help = "Maximum source items to process (1-20)",
-            value_parser = parse_limit
-        )]
-        limit: Option<u8>,
-
-        #[command(flatten)]
-        score: ScoreOptions,
-
-        #[command(subcommand)]
-        input: ScoreInput,
-    },
+    input: ScoreInput,
 }
 
 #[derive(Debug, Args)]
@@ -157,12 +148,11 @@ impl PreparedDocument {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let Command::Score {
+    let Cli {
         limit,
         score,
         input,
-    } = cli.command;
+    } = Cli::parse();
     score.validate()?;
 
     match input {
@@ -451,9 +441,7 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cli, Command, ScoreDocument, ScoreInput, ScoreOptions, enforce_word_limit, reject_limit,
-    };
+    use super::{Cli, ScoreDocument, ScoreInput, ScoreOptions, enforce_word_limit, reject_limit};
     use clap::Parser;
 
     #[test]
@@ -461,7 +449,6 @@ mod tests {
         for arguments in [
             [
                 "slopfilter",
-                "score",
                 "--limit",
                 "7",
                 "--dry-run",
@@ -471,7 +458,6 @@ mod tests {
             ],
             [
                 "slopfilter",
-                "score",
                 "matter",
                 "--limit",
                 "7",
@@ -481,17 +467,12 @@ mod tests {
             ],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
-            let Command::Score {
-                limit,
-                score,
-                input: ScoreInput::Matter { .. },
-            } = cli.command
-            else {
-                panic!("expected the Matter score command");
+            let ScoreInput::Matter { .. } = cli.input else {
+                panic!("expected Matter input");
             };
 
-            assert_eq!(limit, Some(7));
-            assert!(score.dry_run);
+            assert_eq!(cli.limit, Some(7));
+            assert!(cli.score.dry_run);
         }
     }
 
