@@ -6,7 +6,7 @@ use std::{
 
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Args, Parser, Subcommand, ValueHint};
 use futures_util::{StreamExt, pin_mut, stream};
 
 pub mod article;
@@ -17,17 +17,19 @@ pub mod store;
 const MAX_CONCURRENT_FETCHES: usize = 4;
 const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
+/// Inspect and score text for likely AI authorship.
 #[derive(Debug, Parser)]
 #[command(about)]
 struct Cli {
-    /// The maximum number of items to score.
-    #[arg(long, global = true, value_hint = ValueHint::Other)]
-    limit: Option<usize>,
+    #[command(subcommand)]
+    input: ScoreInput,
+}
 
+#[derive(Debug, Args)]
+struct GlobalArgs {
     /// The maximum number of words authorized per submission.
     #[arg(
         long,
-        global = true,
         default_value_t = DEFAULT_MAX_SCORE_WORDS,
         value_parser = parse_max_words,
         value_hint = ValueHint::Other
@@ -35,28 +37,29 @@ struct Cli {
     max_words: usize,
 
     /// Inspect inputs without submitting to Pangram.
-    #[arg(long, global = true)]
+    #[arg(long)]
     dry_run: bool,
 
     /// The Pangram API key.
     #[arg(
         long,
-        global = true,
         env = "PANGRAM_API_KEY",
         hide_env_values = true,
         value_name = "KEY",
-        value_hint = ValueHint::Other
+        value_hint = ValueHint::Other,
+        required_unless_present = "dry_run"
     )]
     pangram_api_key: Option<String>,
-
-    #[command(subcommand)]
-    input: ScoreInput,
 }
 
 #[derive(Debug, Subcommand)]
 enum ScoreInput {
     /// Score queued Matter articles.
     Matter {
+        /// The maximum number of items to score.
+        #[arg(long, value_hint = ValueHint::Other)]
+        limit: Option<usize>,
+
         /// The Matter API token.
         #[arg(
             long,
@@ -66,6 +69,9 @@ enum ScoreInput {
             value_hint = ValueHint::Other
         )]
         matter_api_token: String,
+
+        #[command(flatten)]
+        global: GlobalArgs,
     },
 
     /// Score a UTF-8 text or Markdown file.
@@ -73,10 +79,16 @@ enum ScoreInput {
         /// The UTF-8 text or Markdown file to score.
         #[arg(value_name = "PATH", value_hint = ValueHint::FilePath)]
         path: PathBuf,
+
+        #[command(flatten)]
+        global: GlobalArgs,
     },
 
     /// Score UTF-8 text piped on standard input.
-    Stdin,
+    Stdin {
+        #[command(flatten)]
+        global: GlobalArgs,
+    },
 }
 
 enum ScoreDocument {
@@ -129,54 +141,20 @@ impl PreparedDocument {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Cli {
-        limit,
-        max_words,
-        dry_run,
-        pangram_api_key,
-        input,
-    } = Cli::parse();
-    if !dry_run && pangram_api_key.is_none() {
-        bail!("Pangram API key is required unless --dry-run is set");
-    }
+    let Cli { input } = Cli::parse();
 
     match input {
-        ScoreInput::Matter { matter_api_token } => {
-            score_matter(
-                matter_api_token,
-                limit.unwrap_or(1),
-                max_words,
-                dry_run,
-                pangram_api_key,
-            )
-            .await
-        }
-        ScoreInput::File { path } => {
-            reject_limit(limit)?;
-            score_file(path, max_words, dry_run, pangram_api_key).await
-        }
-        ScoreInput::Stdin => {
-            reject_limit(limit)?;
-            score_stdin(max_words, dry_run, pangram_api_key).await
-        }
+        ScoreInput::Matter {
+            limit,
+            matter_api_token,
+            global,
+        } => score_matter(matter_api_token, limit.unwrap_or(1), global).await,
+        ScoreInput::File { path, global } => score_file(path, global).await,
+        ScoreInput::Stdin { global } => score_stdin(global).await,
     }
 }
 
-fn reject_limit(limit: Option<usize>) -> Result<()> {
-    if limit.is_some() {
-        bail!("--limit is only valid for article sources");
-    }
-
-    Ok(())
-}
-
-async fn score_matter(
-    matter_api_token: String,
-    limit: usize,
-    max_words: usize,
-    dry_run: bool,
-    pangram_api_key: Option<String>,
-) -> Result<()> {
+async fn score_matter(matter_api_token: String, limit: usize, global: GlobalArgs) -> Result<()> {
     let documents = load_matter_documents(matter_api_token, limit).await?;
     let total_words = documents
         .iter()
@@ -184,7 +162,7 @@ async fn score_matter(
         .sum::<usize>();
     let available = documents.len();
 
-    score_documents(&documents, max_words, dry_run, pangram_api_key).await?;
+    score_documents(&documents, global).await?;
 
     let noun = if available == 1 {
         "article"
@@ -246,30 +224,15 @@ async fn load_matter_documents(
     Ok(documents)
 }
 
-async fn score_file(
-    path: PathBuf,
-    max_words: usize,
-    dry_run: bool,
-    pangram_api_key: Option<String>,
-) -> Result<()> {
+async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
     let document = PreparedDocument::new(ScoreDocument::File { path, text })?;
 
-    score_documents(
-        std::slice::from_ref(&document),
-        max_words,
-        dry_run,
-        pangram_api_key,
-    )
-    .await
+    score_documents(std::slice::from_ref(&document), global).await
 }
 
-async fn score_stdin(
-    max_words: usize,
-    dry_run: bool,
-    pangram_api_key: Option<String>,
-) -> Result<()> {
+async fn score_stdin(global: GlobalArgs) -> Result<()> {
     if io::stdin().is_terminal() {
         bail!("no piped input; pass text on standard input");
     }
@@ -280,30 +243,22 @@ async fn score_stdin(
         .context("failed to read UTF-8 text from standard input")?;
     let document = PreparedDocument::new(ScoreDocument::Stdin { text })?;
 
-    score_documents(
-        std::slice::from_ref(&document),
-        max_words,
-        dry_run,
-        pangram_api_key,
-    )
-    .await
+    score_documents(std::slice::from_ref(&document), global).await
 }
 
-async fn score_documents(
-    documents: &[PreparedDocument],
-    max_words: usize,
-    dry_run: bool,
-    pangram_api_key: Option<String>,
-) -> Result<()> {
+async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> Result<()> {
     let color = color_enabled();
-    if dry_run {
+    if global.dry_run {
         for document in documents {
             println!(
                 "{}",
                 format_document(&document.document, document.word_count, color)
             );
-            if document.word_count > max_words {
-                println!("  Pangram: dry run; would refuse above the {max_words}-word maximum");
+            if document.word_count > global.max_words {
+                println!(
+                    "  Pangram: dry run; would refuse above the {}-word maximum",
+                    global.max_words
+                );
             } else {
                 println!("  Pangram: dry run; would submit");
             }
@@ -312,15 +267,16 @@ async fn score_documents(
     }
 
     for document in documents {
-        enforce_word_limit(&document.document, document.word_count, max_words)?;
+        enforce_word_limit(&document.document, document.word_count, global.max_words)?;
     }
 
     if documents.is_empty() {
         return Ok(());
     }
 
-    let pangram_api_key =
-        pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
+    let pangram_api_key = global
+        .pangram_api_key
+        .context("Pangram API key is required unless --dry-run is set")?;
     let pangram_client = pangram::Client::new(pangram_api_key);
     let model = pangram_client
         .discover_model()
@@ -449,39 +405,27 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ScoreDocument, ScoreInput, enforce_word_limit, reject_limit};
+    use super::{Cli, ScoreDocument, ScoreInput, enforce_word_limit};
     use clap::Parser;
 
     #[test]
-    fn dry_run_limit_can_precede_or_follow_the_source() {
-        for arguments in [
-            [
-                "slopfilter",
-                "--limit",
-                "101",
-                "--dry-run",
-                "matter",
-                "--matter-api-token",
-                "token",
-            ],
-            [
-                "slopfilter",
-                "matter",
-                "--limit",
-                "101",
-                "--dry-run",
-                "--matter-api-token",
-                "token",
-            ],
-        ] {
-            let cli = Cli::try_parse_from(arguments).unwrap();
-            let ScoreInput::Matter { .. } = cli.input else {
-                panic!("expected Matter input");
-            };
+    fn matter_options_follow_the_source() {
+        let cli = Cli::try_parse_from([
+            "slopfilter",
+            "matter",
+            "--limit",
+            "101",
+            "--dry-run",
+            "--matter-api-token",
+            "token",
+        ])
+        .unwrap();
+        let ScoreInput::Matter { limit, global, .. } = cli.input else {
+            panic!("expected Matter input");
+        };
 
-            assert_eq!(cli.limit, Some(101));
-            assert!(cli.dry_run);
-        }
+        assert_eq!(limit, Some(101));
+        assert!(global.dry_run);
     }
 
     #[test]
@@ -497,12 +441,6 @@ mod tests {
             ])
             .is_ok()
         );
-    }
-
-    #[test]
-    fn limit_is_rejected_for_non_source_inputs() {
-        reject_limit(None).unwrap();
-        assert!(reject_limit(Some(1)).is_err());
     }
 
     #[test]
