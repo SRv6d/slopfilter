@@ -25,8 +25,8 @@ struct Cli {
         long,
         global = true,
         value_name = "COUNT",
-        help = "Maximum source items to process (1-20)",
-        value_parser = clap::value_parser!(u8).range(1..=20)
+        help = "Maximum source items to process (1-100)",
+        value_parser = clap::value_parser!(u8).range(1..=100)
     )]
     limit: Option<u8>,
 
