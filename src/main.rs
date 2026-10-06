@@ -25,10 +25,9 @@ struct Cli {
         long,
         global = true,
         value_name = "COUNT",
-        help = "Maximum source items to process (1-100)",
-        value_parser = clap::value_parser!(u8).range(1..=100)
+        help = "Maximum source items to process"
     )]
-    limit: Option<u8>,
+    limit: Option<usize>,
 
     #[command(flatten)]
     score: ScoreOptions,
@@ -170,7 +169,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn reject_limit(limit: Option<u8>) -> Result<()> {
+fn reject_limit(limit: Option<usize>) -> Result<()> {
     if limit.is_some() {
         bail!("--limit is only valid for article sources");
     }
@@ -178,7 +177,7 @@ fn reject_limit(limit: Option<u8>) -> Result<()> {
     Ok(())
 }
 
-async fn score_matter(matter_api_token: String, limit: u8, score: ScoreOptions) -> Result<()> {
+async fn score_matter(matter_api_token: String, limit: usize, score: ScoreOptions) -> Result<()> {
     let documents = load_matter_documents(matter_api_token, limit).await?;
     let total_words = documents
         .iter()
@@ -199,7 +198,7 @@ async fn score_matter(matter_api_token: String, limit: u8, score: ScoreOptions) 
 
 async fn load_matter_documents(
     matter_api_token: String,
-    limit: u8,
+    limit: usize,
 ) -> Result<Vec<PreparedDocument>> {
     let client = matter::Client::new(matter_api_token);
     let articles = client
@@ -438,7 +437,7 @@ mod tests {
             [
                 "slopfilter",
                 "--limit",
-                "7",
+                "101",
                 "--dry-run",
                 "matter",
                 "--matter-api-token",
@@ -448,7 +447,7 @@ mod tests {
                 "slopfilter",
                 "matter",
                 "--limit",
-                "7",
+                "101",
                 "--dry-run",
                 "--matter-api-token",
                 "token",
@@ -459,7 +458,7 @@ mod tests {
                 panic!("expected Matter input");
             };
 
-            assert_eq!(cli.limit, Some(7));
+            assert_eq!(cli.limit, Some(101));
             assert!(cli.score.dry_run);
         }
     }

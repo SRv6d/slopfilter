@@ -105,7 +105,7 @@ impl Client {
         }
     }
 
-    pub(crate) async fn queued_articles(&self, limit: u8) -> Result<Vec<QueuedArticle>, Error> {
+    pub(crate) async fn queued_articles(&self, limit: usize) -> Result<Vec<QueuedArticle>, Error> {
         let limit = limit.to_string();
         let listed: ItemList = self
             .http
