@@ -26,7 +26,7 @@ struct Cli {
         global = true,
         value_name = "COUNT",
         help = "Maximum source items to process (1-20)",
-        value_parser = parse_limit
+        value_parser = clap::value_parser!(u8).range(1..=20)
     )]
     limit: Option<u8>,
 
@@ -412,18 +412,6 @@ fn render_title(title: &str, color: bool) -> String {
         format!("{style}{title}{style:#}")
     } else {
         title.to_owned()
-    }
-}
-
-fn parse_limit(value: &str) -> std::result::Result<u8, String> {
-    let limit = value
-        .parse::<u8>()
-        .map_err(|_| "limit must be an integer between 1 and 20".to_owned())?;
-
-    if (1..=20).contains(&limit) {
-        Ok(limit)
-    } else {
-        Err("limit must be between 1 and 20".to_owned())
     }
 }
 
