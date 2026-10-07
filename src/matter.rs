@@ -1,7 +1,7 @@
 //! Matter source adapter for the Items API.
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
-use crate::article::Article;
+use crate::document::Document;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
     Client as HttpClient, StatusCode,
@@ -28,9 +28,7 @@ pub(crate) struct Client {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct UnavailableItem {
-    pub(crate) id: String,
-    pub(crate) title: String,
+pub(crate) struct UnavailableDocument {
     pub(crate) reason: String,
 }
 
@@ -57,9 +55,9 @@ pub(crate) enum Error {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ItemOutcome {
-    Available(Article),
-    Unavailable(UnavailableItem),
+pub(crate) enum DocumentOutcome {
+    Available(Document),
+    Unavailable(UnavailableDocument),
 }
 
 struct ContentRequestGate {
@@ -132,7 +130,7 @@ impl Client {
             .collect())
     }
 
-    pub(crate) async fn fetch_article(&self, id: &str) -> Result<ItemOutcome, Error> {
+    pub(crate) async fn fetch_document(&self, id: &str) -> Result<DocumentOutcome, Error> {
         self.item(id).await?.into_availability()
     }
 
@@ -201,7 +199,7 @@ struct Item {
 }
 
 impl Item {
-    fn into_availability(self) -> Result<ItemOutcome, Error> {
+    fn into_availability(self) -> Result<DocumentOutcome, Error> {
         let Self {
             id,
             title,
@@ -209,45 +207,39 @@ impl Item {
             processing_status,
             markdown,
         } = self;
-        let url = Url::parse(&url).map_err(|source| Error::InvalidUrl {
-            id: id.clone(),
-            source,
-        })?;
+        let url = Url::parse(&url).map_err(|source| Error::InvalidUrl { id, source })?;
         let title = title.trim().to_owned();
 
         if processing_status != "completed" {
-            return Ok(ItemOutcome::Unavailable(UnavailableItem {
-                id,
-                title: title.clone(),
+            return Ok(DocumentOutcome::Unavailable(UnavailableDocument {
                 reason: format!("content extraction is {processing_status}"),
             }));
         }
 
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
-            return Ok(ItemOutcome::Unavailable(UnavailableItem {
-                id,
-                title: title.clone(),
+            return Ok(DocumentOutcome::Unavailable(UnavailableDocument {
                 reason: "Matter returned no extracted Markdown".to_owned(),
             }));
         };
 
-        Ok(ItemOutcome::Available(Article {
-            source_id: id,
-            title: title.trim().to_owned(),
-            url,
-            markdown,
+        Ok(DocumentOutcome::Available(Document {
+            title: Some(title),
+            url: Some(url),
+            text: markdown,
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_RETRY_AFTER, Error, Item, ItemOutcome, UnavailableItem, retry_after};
+    use super::{
+        DEFAULT_RETRY_AFTER, DocumentOutcome, Error, Item, UnavailableDocument, retry_after,
+    };
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
 
     #[test]
-    fn completed_item_maps_to_an_article() {
+    fn completed_item_maps_to_a_document() {
         let item: Item = serde_json::from_str(
             r##"{
                 "id": "itm_123",
@@ -259,14 +251,17 @@ mod tests {
         )
         .unwrap();
 
-        let ItemOutcome::Available(article) = item.into_availability().unwrap() else {
-            panic!("expected an available article");
+        let DocumentOutcome::Available(document) = item.into_availability().unwrap() else {
+            panic!("expected an available document");
         };
 
-        assert_eq!(article.source_id, "itm_123");
-        assert_eq!(article.title, "A saved article");
-        assert_eq!(article.url.as_str(), "https://example.com/article");
-        assert_eq!(article.word_count(), 4);
+        assert_eq!(document.title.as_deref(), Some("A saved article"));
+        assert_eq!(
+            document.url.as_ref().map(url::Url::as_str),
+            Some("https://example.com/article")
+        );
+        assert_eq!(document.text, "# Heading\n\nArticle body");
+        assert_eq!(document.word_count(), 4);
     }
 
     #[test]
@@ -303,9 +298,7 @@ mod tests {
 
         assert_eq!(
             item.into_availability().unwrap(),
-            ItemOutcome::Unavailable(UnavailableItem {
-                id: "itm_123".to_owned(),
-                title: "A saved article".to_owned(),
+            DocumentOutcome::Unavailable(UnavailableDocument {
                 reason: "content extraction is processing".to_owned(),
             })
         );
@@ -326,9 +319,7 @@ mod tests {
 
         assert_eq!(
             item.into_availability().unwrap(),
-            ItemOutcome::Unavailable(UnavailableItem {
-                id: "itm_123".to_owned(),
-                title: "A saved article".to_owned(),
+            DocumentOutcome::Unavailable(UnavailableDocument {
                 reason: "Matter returned no extracted Markdown".to_owned(),
             })
         );

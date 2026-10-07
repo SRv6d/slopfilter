@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use futures_util::{StreamExt, pin_mut, stream};
 
-pub mod article;
+pub mod document;
 pub mod matter;
 pub mod pangram;
 pub mod store;
@@ -91,29 +91,34 @@ enum ScoreInput {
     },
 }
 
-enum ScoreDocument {
-    Matter(article::Article),
-    File { path: PathBuf, text: String },
-    Stdin { text: String },
+enum InputDocument {
+    Matter {
+        item_id: String,
+        document: document::Document,
+    },
+    File {
+        path: PathBuf,
+        document: document::Document,
+    },
+    Stdin {
+        document: document::Document,
+    },
 }
 
-impl ScoreDocument {
-    fn text(&self) -> &str {
+impl InputDocument {
+    fn document(&self) -> &document::Document {
         match self {
-            Self::Matter(article) => &article.markdown,
-            Self::File { text, .. } | Self::Stdin { text } => text,
+            Self::Matter { document, .. }
+            | Self::File { document, .. }
+            | Self::Stdin { document } => document,
         }
     }
-
-    fn word_count(&self) -> usize {
-        self.text().split_whitespace().count()
-    }
 }
 
-impl std::fmt::Display for ScoreDocument {
+impl std::fmt::Display for InputDocument {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Matter(article) => write!(formatter, "Matter item {}", article.source_id),
+            Self::Matter { item_id, .. } => write!(formatter, "Matter item {item_id}"),
             Self::File { path, .. } => write!(formatter, "file {}", path.display()),
             Self::Stdin { .. } => formatter.write_str("standard input"),
         }
@@ -121,17 +126,17 @@ impl std::fmt::Display for ScoreDocument {
 }
 
 struct PreparedDocument {
-    document: ScoreDocument,
+    document: InputDocument,
     word_count: usize,
 }
 
 impl PreparedDocument {
-    fn new(document: ScoreDocument) -> Result<Self> {
-        if document.text().trim().is_empty() {
+    fn new(document: InputDocument) -> Result<Self> {
+        if document.document().text.trim().is_empty() {
             bail!("{document} contains no text");
         }
 
-        let word_count = document.word_count();
+        let word_count = document.document().word_count();
         Ok(Self {
             document,
             word_count,
@@ -189,7 +194,7 @@ async fn load_matter_documents(
             let client = client.clone();
 
             async move {
-                let outcome = client.fetch_article(&item.id).await;
+                let outcome = client.fetch_document(&item.id).await;
                 (item, outcome)
             }
         })
@@ -200,11 +205,14 @@ async fn load_matter_documents(
 
     while let Some((item, outcome)) = fetches.next().await {
         match outcome {
-            Ok(matter::ItemOutcome::Available(article)) => {
-                documents.push(PreparedDocument::new(ScoreDocument::Matter(article))?);
+            Ok(matter::DocumentOutcome::Available(document)) => {
+                documents.push(PreparedDocument::new(InputDocument::Matter {
+                    item_id: item.id,
+                    document,
+                })?);
             }
-            Ok(matter::ItemOutcome::Unavailable(item)) => {
-                eprintln!("{}", format_unavailable(&item, color));
+            Ok(matter::DocumentOutcome::Unavailable(unavailable)) => {
+                eprintln!("{}", format_unavailable(&item, &unavailable, color));
             }
             Err(error) => {
                 failures += 1;
@@ -227,7 +235,14 @@ async fn load_matter_documents(
 async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
-    let document = PreparedDocument::new(ScoreDocument::File { path, text })?;
+    let document = PreparedDocument::new(InputDocument::File {
+        path,
+        document: document::Document {
+            title: None,
+            url: None,
+            text,
+        },
+    })?;
 
     score_documents(std::slice::from_ref(&document), global).await
 }
@@ -241,7 +256,13 @@ async fn score_stdin(global: GlobalArgs) -> Result<()> {
     io::stdin()
         .read_to_string(&mut text)
         .context("failed to read UTF-8 text from standard input")?;
-    let document = PreparedDocument::new(ScoreDocument::Stdin { text })?;
+    let document = PreparedDocument::new(InputDocument::Stdin {
+        document: document::Document {
+            title: None,
+            url: None,
+            text,
+        },
+    })?;
 
     score_documents(std::slice::from_ref(&document), global).await
 }
@@ -285,7 +306,7 @@ async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> 
 
     for document in documents {
         let outcome = pangram_client
-            .score(document.document.text(), &model)
+            .score(&document.document.document().text, &model)
             .await
             .with_context(|| format!("failed to score {}", document.document))?;
 
@@ -312,7 +333,7 @@ async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> 
     Ok(())
 }
 
-fn enforce_word_limit(document: &ScoreDocument, word_count: usize, max_words: usize) -> Result<()> {
+fn enforce_word_limit(document: &InputDocument, word_count: usize, max_words: usize) -> Result<()> {
     if word_count > max_words {
         bail!(
             "refusing to score {word_count} words from {document}; maximum is {max_words}. \
@@ -327,23 +348,38 @@ fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
-fn format_article(article: &article::Article, word_count: usize, color: bool) -> String {
-    format!(
-        "{}\n  {}\n  {word_count} words · Matter: {}",
-        render_title(&article.title, color),
-        article.url,
-        article.source_id,
-    )
+fn format_matter_document(
+    item_id: &str,
+    document: &document::Document,
+    word_count: usize,
+    color: bool,
+) -> String {
+    let title = document
+        .title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Untitled");
+    let mut output = render_title(title, color);
+    if let Some(url) = &document.url {
+        use std::fmt::Write as _;
+        write!(output, "\n  {url}").expect("writing to a String cannot fail");
+    }
+    use std::fmt::Write as _;
+    write!(output, "\n  {word_count} words · Matter: {item_id}")
+        .expect("writing to a String cannot fail");
+    output
 }
 
-fn format_document(document: &ScoreDocument, word_count: usize, color: bool) -> String {
+fn format_document(document: &InputDocument, word_count: usize, color: bool) -> String {
     match document {
-        ScoreDocument::Matter(article) => format_article(article, word_count, color),
-        ScoreDocument::File { path, .. } => format!(
+        InputDocument::Matter { item_id, document } => {
+            format_matter_document(item_id, document, word_count, color)
+        }
+        InputDocument::File { path, .. } => format!(
             "{}\n  {word_count} words · File",
             render_title(&path.display().to_string(), color)
         ),
-        ScoreDocument::Stdin { .. } => format!(
+        InputDocument::Stdin { .. } => format!(
             "{}\n  {word_count} words",
             render_title("Standard input", color)
         ),
@@ -351,7 +387,7 @@ fn format_document(document: &ScoreDocument, word_count: usize, color: bool) -> 
 }
 
 fn format_scored_document(
-    document: &ScoreDocument,
+    document: &InputDocument,
     word_count: usize,
     score: &pangram::Score,
     color: bool,
@@ -373,11 +409,15 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(item: &matter::UnavailableItem, color: bool) -> String {
+fn format_unavailable(
+    item: &matter::QueuedArticle,
+    unavailable: &matter::UnavailableDocument,
+    color: bool,
+) -> String {
     format!(
         "Unavailable: {}\n  {} · Matter: {}",
         render_title(&item.title, color),
-        item.reason,
+        unavailable.reason,
         item.id,
     )
 }
@@ -405,7 +445,7 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ScoreDocument, ScoreInput, enforce_word_limit};
+    use super::{Cli, InputDocument, ScoreInput, enforce_word_limit};
     use clap::Parser;
 
     #[test]
@@ -445,10 +485,14 @@ mod tests {
 
     #[test]
     fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
-        let document = ScoreDocument::Stdin {
-            text: "word ".repeat(2_001),
+        let document = InputDocument::Stdin {
+            document: crate::document::Document {
+                title: None,
+                url: None,
+                text: "word ".repeat(2_001),
+            },
         };
-        let word_count = document.word_count();
+        let word_count = document.document().word_count();
 
         let error = enforce_word_limit(&document, word_count, 2_000).unwrap_err();
         assert!(error.to_string().contains("--max-words 2001"));
