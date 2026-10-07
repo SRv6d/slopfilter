@@ -205,14 +205,14 @@ async fn load_matter_documents(
 
     while let Some((item, outcome)) = fetches.next().await {
         match outcome {
-            Ok(matter::DocumentOutcome::Available(document)) => {
+            Ok(document) => {
                 documents.push(PreparedDocument::new(InputDocument::Matter {
                     item_id: item.id,
                     document,
                 })?);
             }
-            Ok(matter::DocumentOutcome::Unavailable(unavailable)) => {
-                eprintln!("{}", format_unavailable(&item, &unavailable, color));
+            Err(matter::Error::Unavailable { reason }) => {
+                eprintln!("{}", format_unavailable(&item, &reason, color));
             }
             Err(error) => {
                 failures += 1;
@@ -409,15 +409,11 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(
-    item: &matter::QueuedArticle,
-    unavailable: &matter::UnavailableDocument,
-    color: bool,
-) -> String {
+fn format_unavailable(item: &matter::QueuedArticle, reason: &str, color: bool) -> String {
     format!(
         "Unavailable: {}\n  {} · Matter: {}",
         render_title(&item.title, color),
-        unavailable.reason,
+        reason,
         item.id,
     )
 }

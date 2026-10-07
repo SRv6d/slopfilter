@@ -27,11 +27,6 @@ pub(crate) struct Client {
     content_gate: Arc<ContentRequestGate>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct UnavailableDocument {
-    pub(crate) reason: String,
-}
-
 #[derive(Debug)]
 pub(crate) struct QueuedArticle {
     pub(crate) id: String,
@@ -40,6 +35,9 @@ pub(crate) struct QueuedArticle {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
+    #[error("Matter document is unavailable: {reason}")]
+    Unavailable { reason: String },
+
     #[error("Matter API request failed")]
     Request(#[from] reqwest::Error),
 
@@ -52,12 +50,6 @@ pub(crate) enum Error {
 
     #[error("Matter rate limit persisted while fetching {id} after {retries} retries")]
     RateLimited { id: String, retries: u8 },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DocumentOutcome {
-    Available(Document),
-    Unavailable(UnavailableDocument),
 }
 
 struct ContentRequestGate {
@@ -130,8 +122,8 @@ impl Client {
             .collect())
     }
 
-    pub(crate) async fn fetch_document(&self, id: &str) -> Result<DocumentOutcome, Error> {
-        self.item(id).await?.into_availability()
+    pub(crate) async fn fetch_document(&self, id: &str) -> Result<Document, Error> {
+        self.item(id).await?.into_document()
     }
 
     async fn item(&self, id: &str) -> Result<Item, Error> {
@@ -199,7 +191,7 @@ struct Item {
 }
 
 impl Item {
-    fn into_availability(self) -> Result<DocumentOutcome, Error> {
+    fn into_document(self) -> Result<Document, Error> {
         let Self {
             id,
             title,
@@ -211,30 +203,28 @@ impl Item {
         let title = title.trim().to_owned();
 
         if processing_status != "completed" {
-            return Ok(DocumentOutcome::Unavailable(UnavailableDocument {
+            return Err(Error::Unavailable {
                 reason: format!("content extraction is {processing_status}"),
-            }));
+            });
         }
 
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
-            return Ok(DocumentOutcome::Unavailable(UnavailableDocument {
+            return Err(Error::Unavailable {
                 reason: "Matter returned no extracted Markdown".to_owned(),
-            }));
+            });
         };
 
-        Ok(DocumentOutcome::Available(Document {
+        Ok(Document {
             title: Some(title),
             url: Some(url),
             text: markdown,
-        }))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_RETRY_AFTER, DocumentOutcome, Error, Item, UnavailableDocument, retry_after,
-    };
+    use super::{DEFAULT_RETRY_AFTER, Error, Item, retry_after};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
 
@@ -251,9 +241,7 @@ mod tests {
         )
         .unwrap();
 
-        let DocumentOutcome::Available(document) = item.into_availability().unwrap() else {
-            panic!("expected an available document");
-        };
+        let document = item.into_document().unwrap();
 
         assert_eq!(document.title.as_deref(), Some("A saved article"));
         assert_eq!(
@@ -278,7 +266,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            item.into_availability(),
+            item.into_document(),
             Err(Error::InvalidUrl { id, .. }) if id == "itm_123"
         ));
     }
@@ -296,12 +284,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            item.into_availability().unwrap(),
-            DocumentOutcome::Unavailable(UnavailableDocument {
-                reason: "content extraction is processing".to_owned(),
-            })
-        );
+        assert!(matches!(
+            item.into_document(),
+            Err(Error::Unavailable { reason }) if reason == "content extraction is processing"
+        ));
     }
 
     #[test]
@@ -317,12 +303,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            item.into_availability().unwrap(),
-            DocumentOutcome::Unavailable(UnavailableDocument {
-                reason: "Matter returned no extracted Markdown".to_owned(),
-            })
-        );
+        assert!(matches!(
+            item.into_document(),
+            Err(Error::Unavailable { reason })
+                if reason == "Matter returned no extracted Markdown"
+        ));
     }
 
     #[test]
