@@ -1,7 +1,7 @@
 //! Matter source adapter for the Items API.
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
-use crate::document::Document;
+use super::Document;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
     Client as HttpClient, StatusCode,

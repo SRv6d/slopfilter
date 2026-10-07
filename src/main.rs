@@ -8,10 +8,10 @@ use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use futures_util::{StreamExt, pin_mut, stream};
+use source::Document;
 
-pub mod document;
-pub mod matter;
 pub mod pangram;
+pub mod source;
 pub mod store;
 
 const MAX_CONCURRENT_FETCHES: usize = 4;
@@ -92,21 +92,13 @@ enum ScoreInput {
 }
 
 enum InputDocument {
-    Matter {
-        item_id: String,
-        document: document::Document,
-    },
-    File {
-        path: PathBuf,
-        document: document::Document,
-    },
-    Stdin {
-        document: document::Document,
-    },
+    Matter { item_id: String, document: Document },
+    File { path: PathBuf, document: Document },
+    Stdin { document: Document },
 }
 
 impl InputDocument {
-    fn document(&self) -> &document::Document {
+    fn document(&self) -> &Document {
         match self {
             Self::Matter { document, .. }
             | Self::File { document, .. }
@@ -182,7 +174,7 @@ async fn load_matter_documents(
     matter_api_token: String,
     limit: usize,
 ) -> Result<Vec<PreparedDocument>> {
-    let client = matter::Client::new(matter_api_token);
+    let client = source::matter::Client::new(matter_api_token);
     let articles = client
         .queued_articles(limit)
         .await
@@ -211,7 +203,7 @@ async fn load_matter_documents(
                     document,
                 })?);
             }
-            Err(matter::Error::Unavailable { reason }) => {
+            Err(source::matter::Error::Unavailable { reason }) => {
                 eprintln!("{}", format_unavailable(&item, &reason, color));
             }
             Err(error) => {
@@ -237,7 +229,7 @@ async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
         .with_context(|| format!("failed to read UTF-8 text from {}", path.display()))?;
     let document = PreparedDocument::new(InputDocument::File {
         path,
-        document: document::Document {
+        document: Document {
             title: None,
             url: None,
             text,
@@ -257,7 +249,7 @@ async fn score_stdin(global: GlobalArgs) -> Result<()> {
         .read_to_string(&mut text)
         .context("failed to read UTF-8 text from standard input")?;
     let document = PreparedDocument::new(InputDocument::Stdin {
-        document: document::Document {
+        document: Document {
             title: None,
             url: None,
             text,
@@ -350,7 +342,7 @@ fn color_enabled() -> bool {
 
 fn format_matter_document(
     item_id: &str,
-    document: &document::Document,
+    document: &Document,
     word_count: usize,
     color: bool,
 ) -> String {
@@ -409,7 +401,7 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(item: &matter::QueuedArticle, reason: &str, color: bool) -> String {
+fn format_unavailable(item: &source::matter::QueuedArticle, reason: &str, color: bool) -> String {
     format!(
         "Unavailable: {}\n  {} · Matter: {}",
         render_title(&item.title, color),
@@ -482,7 +474,7 @@ mod tests {
     #[test]
     fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
         let document = InputDocument::Stdin {
-            document: crate::document::Document {
+            document: crate::source::Document {
                 title: None,
                 url: None,
                 text: "word ".repeat(2_001),

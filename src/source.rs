@@ -1,4 +1,6 @@
 //! Source-independent content passed between pipeline stages.
+pub mod matter;
+
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
