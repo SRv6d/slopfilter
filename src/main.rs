@@ -8,7 +8,7 @@ use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use futures_util::{StreamExt, pin_mut, stream};
-use source::Document;
+use source::{Document, matter};
 
 pub mod pangram;
 pub mod source;
@@ -54,8 +54,16 @@ struct GlobalArgs {
 
 #[derive(Debug, Subcommand)]
 enum ScoreInput {
-    /// Score queued Matter articles.
+    /// Score Matter articles.
     Matter {
+        /// Filter items by status.
+        #[arg(long, value_enum, default_values_t = [matter::Status::default()])]
+        status: Vec<matter::Status>,
+
+        /// Filter items by their tag.
+        #[arg(long, value_hint = ValueHint::Other)]
+        tag: Vec<String>,
+
         /// The maximum number of items to score.
         #[arg(long, value_hint = ValueHint::Other)]
         limit: Option<usize>,
@@ -142,17 +150,25 @@ async fn main() -> Result<()> {
 
     match input {
         ScoreInput::Matter {
+            status,
+            tag,
             limit,
             matter_api_token,
             global,
-        } => score_matter(matter_api_token, limit.unwrap_or(1), global).await,
+        } => score_matter(matter_api_token, status, tag, limit.unwrap_or(1), global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
     }
 }
 
-async fn score_matter(matter_api_token: String, limit: usize, global: GlobalArgs) -> Result<()> {
-    let documents = load_matter_documents(matter_api_token, limit).await?;
+async fn score_matter(
+    matter_api_token: String,
+    statuses: Vec<matter::Status>,
+    tags: Vec<String>,
+    limit: usize,
+    global: GlobalArgs,
+) -> Result<()> {
+    let documents = load_matter_documents(matter_api_token, statuses, tags, limit).await?;
     let total_words = documents
         .iter()
         .map(|document| document.word_count)
@@ -172,13 +188,15 @@ async fn score_matter(matter_api_token: String, limit: usize, global: GlobalArgs
 
 async fn load_matter_documents(
     matter_api_token: String,
+    statuses: Vec<matter::Status>,
+    tags: Vec<String>,
     limit: usize,
 ) -> Result<Vec<PreparedDocument>> {
-    let client = source::matter::Client::new(matter_api_token);
+    let client = matter::Client::new(matter_api_token);
     let articles = client
-        .queued_articles(limit)
+        .articles(statuses, tags, limit)
         .await
-        .context("failed to list queued Matter articles")?;
+        .context("failed to list Matter articles")?;
     let mut documents = Vec::with_capacity(articles.len());
     let color = color_enabled();
     let fetches = stream::iter(articles)
@@ -203,7 +221,7 @@ async fn load_matter_documents(
                     document,
                 })?);
             }
-            Err(source::matter::Error::Unavailable { reason }) => {
+            Err(matter::Error::Unavailable { reason }) => {
                 eprintln!("{}", format_unavailable(&item, &reason, color));
             }
             Err(error) => {
@@ -218,7 +236,7 @@ async fn load_matter_documents(
     }
 
     if failures > 0 {
-        bail!("failed to fetch {failures} queued Matter article(s)");
+        bail!("failed to fetch {failures} Matter article(s)");
     }
 
     Ok(documents)
@@ -401,7 +419,7 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(item: &source::matter::QueuedArticle, reason: &str, color: bool) -> String {
+fn format_unavailable(item: &matter::Article, reason: &str, color: bool) -> String {
     format!(
         "Unavailable: {}\n  {} · Matter: {}",
         render_title(&item.title, color),
@@ -433,7 +451,7 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, InputDocument, ScoreInput, enforce_word_limit};
+    use super::{Cli, InputDocument, ScoreInput, enforce_word_limit, matter};
     use clap::Parser;
 
     #[test]
@@ -441,6 +459,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "slopfilter",
             "matter",
+            "--status",
+            "inbox",
+            "--status",
+            "queue",
+            "--tag",
+            "tag_one",
+            "--tag",
+            "tag_two",
             "--limit",
             "101",
             "--dry-run",
@@ -448,12 +474,54 @@ mod tests {
             "token",
         ])
         .unwrap();
-        let ScoreInput::Matter { limit, global, .. } = cli.input else {
+        let ScoreInput::Matter {
+            limit,
+            status,
+            tag,
+            global,
+            ..
+        } = cli.input
+        else {
             panic!("expected Matter input");
         };
 
         assert_eq!(limit, Some(101));
+        assert_eq!(status, [matter::Status::Inbox, matter::Status::Queue]);
+        assert_eq!(tag, ["tag_one", "tag_two"]);
         assert!(global.dry_run);
+    }
+
+    #[test]
+    fn matter_status_defaults_to_queue() {
+        let cli = Cli::try_parse_from([
+            "slopfilter",
+            "matter",
+            "--dry-run",
+            "--matter-api-token",
+            "token",
+        ])
+        .unwrap();
+        let ScoreInput::Matter { status, .. } = cli.input else {
+            panic!("expected Matter input");
+        };
+
+        assert_eq!(status, [matter::Status::Queue]);
+    }
+
+    #[test]
+    fn matter_status_does_not_accept_all() {
+        assert!(
+            Cli::try_parse_from([
+                "slopfilter",
+                "matter",
+                "--status",
+                "all",
+                "--dry-run",
+                "--matter-api-token",
+                "token",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

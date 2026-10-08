@@ -1,5 +1,10 @@
 //! Matter source adapter for the Items API.
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    fmt::{self, Write as _},
+    num::NonZeroU32,
+    sync::Arc,
+    time::Duration,
+};
 
 use super::Document;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -27,8 +32,26 @@ pub(crate) struct Client {
     content_gate: Arc<ContentRequestGate>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Status {
+    Inbox,
+    #[default]
+    Queue,
+    Archive,
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Inbox => "inbox",
+            Self::Queue => "queue",
+            Self::Archive => "archive",
+        })
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct QueuedArticle {
+pub(crate) struct Article {
     pub(crate) id: String,
     pub(crate) title: String,
 }
@@ -37,6 +60,9 @@ pub(crate) struct QueuedArticle {
 pub(crate) enum Error {
     #[error("Matter document is unavailable: {reason}")]
     Unavailable { reason: String },
+
+    #[error("at least one Matter item status is required")]
+    MissingStatus,
 
     #[error("Matter API request failed")]
     Request(#[from] reqwest::Error),
@@ -95,27 +121,34 @@ impl Client {
         }
     }
 
-    pub(crate) async fn queued_articles(&self, limit: usize) -> Result<Vec<QueuedArticle>, Error> {
+    pub(crate) async fn articles(
+        &self,
+        statuses: impl IntoIterator<Item = Status>,
+        tags: impl IntoIterator<Item = String>,
+        limit: usize,
+    ) -> Result<Vec<Article>, Error> {
+        let statuses = comma_separated(statuses).ok_or(Error::MissingStatus)?;
+        let tags = comma_separated(tags);
         let limit = limit.to_string();
-        let listed: ItemList = self
+        let request = self
             .http
             .get(format!("{API_BASE_URL}/items"))
             .bearer_auth(&self.token)
             .query(&[
-                ("status", "queue"),
+                ("status", statuses.as_str()),
                 ("content_type", "article"),
-                ("limit", &limit),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+                ("limit", limit.as_str()),
+            ]);
+        let request = match tags.as_deref() {
+            Some(tags) => request.query(&[("tag", tags)]),
+            None => request,
+        };
+        let listed: ItemList = request.send().await?.error_for_status()?.json().await?;
 
         Ok(listed
             .results
             .into_iter()
-            .map(|item| QueuedArticle {
+            .map(|item| Article {
                 id: item.id,
                 title: item.title.trim().to_owned(),
             })
@@ -158,6 +191,17 @@ impl Client {
 
         unreachable!("a bounded retry loop always returns")
     }
+}
+
+fn comma_separated<T: fmt::Display>(values: impl IntoIterator<Item = T>) -> Option<String> {
+    let mut values = values.into_iter();
+    let mut filter = values.next()?.to_string();
+
+    for value in values {
+        write!(&mut filter, ",{value}").unwrap();
+    }
+
+    Some(filter)
 }
 
 fn retry_after(headers: &HeaderMap) -> Duration {
@@ -224,9 +268,22 @@ impl Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_RETRY_AFTER, Error, Item, retry_after};
+    use super::{DEFAULT_RETRY_AFTER, Error, Item, Status, comma_separated, retry_after};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
+
+    #[test]
+    fn filter_values_are_serialized_for_api_queries() {
+        assert_eq!(
+            comma_separated([Status::Inbox, Status::Queue, Status::Archive]).as_deref(),
+            Some("inbox,queue,archive")
+        );
+        assert_eq!(
+            comma_separated(["tag_one", "tag_two"]).as_deref(),
+            Some("tag_one,tag_two")
+        );
+        assert_eq!(comma_separated::<Status>([]).as_deref(), None);
+    }
 
     #[test]
     fn completed_item_maps_to_a_document() {
