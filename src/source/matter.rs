@@ -65,10 +65,26 @@ pub(crate) struct Item {
     markdown: Option<String>,
 }
 
+#[derive(Debug, clap::Args)]
 pub(crate) struct ListOptions {
-    pub(crate) statuses: Vec<Status>,
-    pub(crate) tags: Vec<String>,
-    pub(crate) limit: usize,
+    /// Filter items by status.
+    #[arg(
+        long,
+        value_enum,
+        default_values_t = [Status::default()],
+    )]
+    pub(crate) status: Vec<Status>,
+
+    /// Filter items by their tag.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::Other,
+    )]
+    pub(crate) tag: Vec<String>,
+
+    /// The maximum number of items to score.
+    #[arg(long, value_hint = clap::ValueHint::Other)]
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -146,13 +162,16 @@ impl Client {
     ) -> impl Stream<Item = Result<Item, Error>> + '_ {
         try_stream! {
             let statuses =
-                comma_separated(options.statuses).ok_or(Error::MissingStatus)?;
-            let tags = comma_separated(options.tags);
+                comma_separated(options.status).ok_or(Error::MissingStatus)?;
+            let tags = comma_separated(options.tag);
             let mut remaining = options.limit;
             let mut cursor = None;
 
-            while remaining > 0 {
-                let page_limit = remaining.min(MAX_ITEMS_PER_PAGE).to_string();
+            while remaining != Some(0) {
+                let page_limit = remaining
+                    .unwrap_or(MAX_ITEMS_PER_PAGE)
+                    .min(MAX_ITEMS_PER_PAGE)
+                    .to_string();
                 let mut request = self
                     .http
                     .get(self.endpoint("items"))
@@ -172,12 +191,18 @@ impl Client {
 
                 let page: ItemList = request.send().await?.error_for_status()?.json().await?;
 
-                for item in page.results.into_iter().take(remaining) {
-                    remaining -= 1;
+                for item in page
+                    .results
+                    .into_iter()
+                    .take(remaining.unwrap_or(usize::MAX))
+                {
+                    if let Some(remaining) = remaining.as_mut() {
+                        *remaining -= 1;
+                    }
                     yield item;
                 }
 
-                if remaining == 0 || !page.has_more {
+                if remaining == Some(0) || !page.has_more {
                     break;
                 }
 
@@ -377,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_follows_pagination_until_the_requested_limit() {
-        let (base_url, server) = pagination_server();
+        let (base_url, server) = pagination_server(["limit=2", "limit=1"]);
         let client = Client {
             http: reqwest::Client::new(),
             token: "secret-token".to_owned(),
@@ -385,9 +410,9 @@ mod tests {
             content_gate: Arc::new(ContentRequestGate::new()),
         };
         let items = client.list_items(ListOptions {
-            statuses: vec![Status::Queue],
-            tags: Vec::new(),
-            limit: 2,
+            status: vec![Status::Queue],
+            tag: Vec::new(),
+            limit: Some(2),
         });
         pin_mut!(items);
 
@@ -400,7 +425,42 @@ mod tests {
         server.join().unwrap();
     }
 
-    fn pagination_server() -> (Url, thread::JoinHandle<()>) {
+    #[tokio::test]
+    async fn list_items_without_a_limit_exhausts_all_pages() {
+        let (base_url, server) = pagination_server(["limit=100", "limit=100"]);
+        let client = Client {
+            http: reqwest::Client::new(),
+            token: "secret-token".to_owned(),
+            base_url,
+            content_gate: Arc::new(ContentRequestGate::new()),
+        };
+        let items = client.list_items(ListOptions {
+            status: vec![Status::Queue],
+            tag: Vec::new(),
+            limit: None,
+        });
+        pin_mut!(items);
+
+        assert_eq!(items.next().await.unwrap().unwrap().id, "itm_first");
+        assert_eq!(items.next().await.unwrap().unwrap().id, "itm_second");
+        assert!(items.next().await.is_none());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_limit_makes_no_request() {
+        let client = Client::new("secret-token".to_owned());
+        let items = client.list_items(ListOptions {
+            status: vec![Status::Queue],
+            tag: Vec::new(),
+            limit: Some(0),
+        });
+        pin_mut!(items);
+
+        assert!(items.next().await.is_none());
+    }
+
+    fn pagination_server(expected_limits: [&'static str; 2]) -> (Url, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -431,7 +491,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_request(&mut stream);
                 assert!(request.starts_with("GET /items?"));
-                assert!(request.contains(if index == 0 { "limit=2" } else { "limit=1" }));
+                assert!(request.contains(expected_limits[index]));
                 if index == 1 {
                     assert!(request.contains("cursor=next"));
                 }

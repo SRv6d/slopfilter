@@ -57,17 +57,8 @@ struct GlobalArgs {
 enum ScoreInput {
     /// Score Matter articles.
     Matter {
-        /// Filter items by status.
-        #[arg(long, value_enum, default_values_t = [matter::Status::default()])]
-        status: Vec<matter::Status>,
-
-        /// Filter items by their tag.
-        #[arg(long, value_hint = ValueHint::Other)]
-        tag: Vec<String>,
-
-        /// The maximum number of items to score.
-        #[arg(long, value_hint = ValueHint::Other)]
-        limit: Option<usize>,
+        #[command(flatten)]
+        list_options: matter::ListOptions,
 
         /// The Matter API token.
         #[arg(
@@ -151,12 +142,10 @@ async fn main() -> Result<()> {
 
     match input {
         ScoreInput::Matter {
-            status,
-            tag,
-            limit,
+            list_options,
             matter_api_token,
             global,
-        } => score_matter(matter_api_token, status, tag, limit.unwrap_or(1), global).await,
+        } => score_matter(matter_api_token, list_options, global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
     }
@@ -164,25 +153,18 @@ async fn main() -> Result<()> {
 
 async fn score_matter(
     matter_api_token: String,
-    statuses: Vec<matter::Status>,
-    tags: Vec<String>,
-    limit: usize,
+    list_options: matter::ListOptions,
     global: GlobalArgs,
 ) -> Result<()> {
     let color = color_enabled();
     let mut scorer =
         scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
     let client = matter::Client::new(matter_api_token);
-    let options = matter::ListOptions {
-        statuses,
-        tags,
-        limit,
-    };
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<
         std::result::Result<(matter::Item, std::result::Result<(), matter::Error>), matter::Error>,
     >(MAX_BUFFERED_MATTER_ITEMS);
     let producer = tokio::spawn(async move {
-        let items = client.list_items_with_markdown(options);
+        let items = client.list_items_with_markdown(list_options);
         pin_mut!(items);
 
         while let Some(item) = items.next().await {
@@ -348,7 +330,7 @@ async fn score_prepared_document(
                 "words"
             };
             println!(
-                "  Pangram: word budget exhausted; {remaining_words} {word_noun} remain, \
+                "  Pangram: word budget exhausted; {remaining_words} {word_noun} remaining, \
                  but this document has {document_words}"
             );
             Ok(false)
@@ -503,9 +485,7 @@ mod tests {
         ])
         .unwrap();
         let ScoreInput::Matter {
-            limit,
-            status,
-            tag,
+            list_options,
             global,
             ..
         } = cli.input
@@ -513,9 +493,12 @@ mod tests {
             panic!("expected Matter input");
         };
 
-        assert_eq!(limit, Some(101));
-        assert_eq!(status, [matter::Status::Inbox, matter::Status::Queue]);
-        assert_eq!(tag, ["tag_one", "tag_two"]);
+        assert_eq!(list_options.limit, Some(101));
+        assert_eq!(
+            list_options.status,
+            [matter::Status::Inbox, matter::Status::Queue]
+        );
+        assert_eq!(list_options.tag, ["tag_one", "tag_two"]);
         assert!(global.dry_run);
     }
 
@@ -529,11 +512,12 @@ mod tests {
             "token",
         ])
         .unwrap();
-        let ScoreInput::Matter { status, .. } = cli.input else {
+        let ScoreInput::Matter { list_options, .. } = cli.input else {
             panic!("expected Matter input");
         };
 
-        assert_eq!(status, [matter::Status::Queue]);
+        assert_eq!(list_options.status, [matter::Status::Queue]);
+        assert_eq!(list_options.limit, None);
     }
 
     #[test]
