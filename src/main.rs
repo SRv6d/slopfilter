@@ -7,14 +7,15 @@ use std::{
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
-use futures_util::{StreamExt, pin_mut, stream};
+use futures_util::{StreamExt, pin_mut};
 use source::{Document, matter};
 
 pub mod pangram;
+pub mod scoring;
 pub mod source;
 pub mod store;
 
-const MAX_CONCURRENT_FETCHES: usize = 4;
+const MAX_BUFFERED_MATTER_ITEMS: usize = 4;
 const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 /// Inspect and score text for likely AI authorship.
@@ -27,7 +28,7 @@ struct Cli {
 
 #[derive(Debug, Args)]
 struct GlobalArgs {
-    /// The maximum number of words authorized per submission.
+    /// The maximum total number of words authorized for this invocation.
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_SCORE_WORDS,
@@ -168,14 +169,101 @@ async fn score_matter(
     limit: usize,
     global: GlobalArgs,
 ) -> Result<()> {
-    let documents = load_matter_documents(matter_api_token, statuses, tags, limit).await?;
-    let total_words = documents
-        .iter()
-        .map(|document| document.word_count)
-        .sum::<usize>();
-    let available = documents.len();
+    let color = color_enabled();
+    let mut scorer =
+        scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
+    let client = matter::Client::new(matter_api_token);
+    let options = matter::ListOptions {
+        statuses,
+        tags,
+        limit,
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<
+        std::result::Result<(matter::Item, std::result::Result<(), matter::Error>), matter::Error>,
+    >(MAX_BUFFERED_MATTER_ITEMS);
+    let producer = tokio::spawn(async move {
+        let items = client.list_items_with_markdown(options);
+        pin_mut!(items);
 
-    score_documents(&documents, global).await?;
+        while let Some(item) = items.next().await {
+            if sender.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut total_words = 0usize;
+    let mut available = 0usize;
+    let mut failures = 0usize;
+    let mut list_error = None;
+
+    let processing = async {
+        while let Some(listed) = receiver.recv().await {
+            let (item, outcome) = match listed {
+                Ok(listed) => listed,
+                Err(error) => {
+                    list_error = Some(error);
+                    break;
+                }
+            };
+
+            match outcome {
+                Ok(()) => {
+                    let (item_id, document) = match item.into_document() {
+                        Ok(document) => document,
+                        Err(error) => {
+                            failures += 1;
+                            eprintln!("Failed: {error}");
+                            continue;
+                        }
+                    };
+                    let document =
+                        PreparedDocument::new(InputDocument::Matter { item_id, document })?;
+
+                    if !score_prepared_document(&mut scorer, &document, color).await? {
+                        break;
+                    }
+
+                    total_words = total_words
+                        .checked_add(document.word_count)
+                        .context("total word count overflowed")?;
+                    available += 1;
+                }
+                Err(matter::Error::Unavailable { reason }) => {
+                    eprintln!("{}", format_unavailable(&item, &reason, color));
+                }
+                Err(error) => {
+                    failures += 1;
+                    eprintln!(
+                        "Failed: {}\n  {error} · Matter: {}",
+                        render_title(&item.title, color),
+                        item.id,
+                    );
+                }
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    drop(receiver);
+    if !producer.is_finished() {
+        producer.abort();
+    }
+    match producer.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(error).context("Matter producer task failed"),
+    }
+    processing?;
+
+    if let Some(error) = list_error {
+        return Err(error).context("failed to list Matter items");
+    }
+    if failures > 0 {
+        bail!("failed to fetch {failures} Matter item(s)");
+    }
 
     let noun = if available == 1 {
         "article"
@@ -184,62 +272,6 @@ async fn score_matter(
     };
     println!("Total: {total_words} words across {available} eligible {noun}.");
     Ok(())
-}
-
-async fn load_matter_documents(
-    matter_api_token: String,
-    statuses: Vec<matter::Status>,
-    tags: Vec<String>,
-    limit: usize,
-) -> Result<Vec<PreparedDocument>> {
-    let client = matter::Client::new(matter_api_token);
-    let articles = client
-        .articles(statuses, tags, limit)
-        .await
-        .context("failed to list Matter articles")?;
-    let mut documents = Vec::with_capacity(articles.len());
-    let color = color_enabled();
-    let fetches = stream::iter(articles)
-        .map(|item| {
-            let client = client.clone();
-
-            async move {
-                let outcome = client.fetch_document(&item.id).await;
-                (item, outcome)
-            }
-        })
-        .buffer_unordered(MAX_CONCURRENT_FETCHES);
-    pin_mut!(fetches);
-
-    let mut failures = 0;
-
-    while let Some((item, outcome)) = fetches.next().await {
-        match outcome {
-            Ok(document) => {
-                documents.push(PreparedDocument::new(InputDocument::Matter {
-                    item_id: item.id,
-                    document,
-                })?);
-            }
-            Err(matter::Error::Unavailable { reason }) => {
-                eprintln!("{}", format_unavailable(&item, &reason, color));
-            }
-            Err(error) => {
-                failures += 1;
-                eprintln!(
-                    "Failed: {}\n  {error} · Matter: {}",
-                    render_title(&item.title, color),
-                    item.id,
-                );
-            }
-        }
-    }
-
-    if failures > 0 {
-        bail!("failed to fetch {failures} Matter article(s)");
-    }
-
-    Ok(documents)
 }
 
 async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
@@ -279,79 +311,75 @@ async fn score_stdin(global: GlobalArgs) -> Result<()> {
 
 async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> Result<()> {
     let color = color_enabled();
-    if global.dry_run {
-        for document in documents {
-            println!(
-                "{}",
-                format_document(&document.document, document.word_count, color)
-            );
-            if document.word_count > global.max_words {
-                println!(
-                    "  Pangram: dry run; would refuse above the {}-word maximum",
-                    global.max_words
-                );
-            } else {
-                println!("  Pangram: dry run; would submit");
-            }
-        }
-        return Ok(());
-    }
+    let mut scorer =
+        scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
 
     for document in documents {
-        enforce_word_limit(&document.document, document.word_count, global.max_words)?;
-    }
-
-    if documents.is_empty() {
-        return Ok(());
-    }
-
-    let pangram_api_key = global
-        .pangram_api_key
-        .context("Pangram API key is required unless --dry-run is set")?;
-    let pangram_client = pangram::Client::new(pangram_api_key);
-    let model = pangram_client
-        .discover_model()
-        .await
-        .context("failed to discover an available Pangram model")?;
-
-    for document in documents {
-        let outcome = pangram_client
-            .score(&document.document.document().text, &model)
-            .await
-            .with_context(|| format!("failed to score {}", document.document))?;
-
-        match outcome {
-            pangram::ScoreOutcome::Complete(score) => {
-                println!(
-                    "{}",
-                    format_scored_document(&document.document, document.word_count, &score, color)
-                );
-            }
-            pangram::ScoreOutcome::Pending { task, stage } => {
-                println!(
-                    "{}",
-                    format_document(&document.document, document.word_count, color)
-                );
-                println!(
-                    "  Pangram task {} ({}) remains {stage} and can be resumed.",
-                    task.task_id, task.model
-                );
-            }
+        if !score_prepared_document(&mut scorer, document, color).await? {
+            break;
         }
     }
 
     Ok(())
 }
 
-fn enforce_word_limit(document: &InputDocument, word_count: usize, max_words: usize) -> Result<()> {
-    if word_count > max_words {
-        bail!(
-            "refusing to score {word_count} words from {document}; maximum is {max_words}. \
-             Use --max-words {word_count} to authorize this submission"
-        );
-    }
+async fn score_prepared_document(
+    scorer: &mut scoring::Scorer,
+    document: &PreparedDocument,
+    color: bool,
+) -> Result<bool> {
+    let outcome = scorer
+        .score(&document.document.document().text, document.word_count)
+        .await
+        .with_context(|| format!("failed to score {}", document.document))?;
 
-    Ok(())
+    match outcome {
+        Err(scoring::BudgetExhausted {
+            document_words,
+            remaining_words,
+        }) => {
+            println!(
+                "{}",
+                format_document(&document.document, document.word_count, color)
+            );
+            let word_noun = if remaining_words == 1 {
+                "word"
+            } else {
+                "words"
+            };
+            println!(
+                "  Pangram: word budget exhausted; {remaining_words} {word_noun} remain, \
+                 but this document has {document_words}"
+            );
+            Ok(false)
+        }
+        Ok(None) => {
+            println!(
+                "{}",
+                format_document(&document.document, document.word_count, color)
+            );
+            println!("  Pangram: dry run; would submit");
+            Ok(true)
+        }
+        Ok(Some(pangram::ScoreOutcome::Complete(score))) => {
+            println!(
+                "{}",
+                format_scored_document(&document.document, document.word_count, &score, color)
+            );
+            Ok(true)
+        }
+        Ok(Some(pangram::ScoreOutcome::Pending { task, stage })) => {
+            println!(
+                "{}",
+                format_document(&document.document, document.word_count, color)
+            );
+            println!(
+                "  Pangram task {} ({}) remains {stage} and can be resumed.",
+                task.task_id, task.model
+            );
+            Ok(true)
+        }
+    }
 }
 
 fn color_enabled() -> bool {
@@ -419,7 +447,7 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(item: &matter::Article, reason: &str, color: bool) -> String {
+fn format_unavailable(item: &matter::Item, reason: &str, color: bool) -> String {
     format!(
         "Unavailable: {}\n  {} · Matter: {}",
         render_title(&item.title, color),
@@ -451,7 +479,7 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, InputDocument, ScoreInput, enforce_word_limit, matter};
+    use super::{Cli, ScoreInput, matter};
     use clap::Parser;
 
     #[test]
@@ -537,21 +565,5 @@ mod tests {
             ])
             .is_ok()
         );
-    }
-
-    #[test]
-    fn scoring_above_the_word_ceiling_requires_an_explicit_override() {
-        let document = InputDocument::Stdin {
-            document: crate::source::Document {
-                title: None,
-                url: None,
-                text: "word ".repeat(2_001),
-            },
-        };
-        let word_count = document.document().word_count();
-
-        let error = enforce_word_limit(&document, word_count, 2_000).unwrap_err();
-        assert!(error.to_string().contains("--max-words 2001"));
-        enforce_word_limit(&document, word_count, 2_001).unwrap();
     }
 }

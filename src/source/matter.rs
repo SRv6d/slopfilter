@@ -7,6 +7,8 @@ use std::{
 };
 
 use super::Document;
+use async_stream::try_stream;
+use futures_util::{Stream, StreamExt};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
     Client as HttpClient, StatusCode,
@@ -20,15 +22,18 @@ use tokio::{
 };
 use url::Url;
 
-const API_BASE_URL: &str = "https://api.getmatter.com/public/v1";
+const API_BASE_URL: &str = "https://api.getmatter.com/public/v1/";
 const MAX_BURST_REQUESTS_PER_SECOND: u32 = 5;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_RETRIES: u8 = 3;
+const MAX_ITEMS_PER_PAGE: usize = 100;
+const MAX_CONCURRENT_CONTENT_REQUESTS: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct Client {
     http: HttpClient,
     token: String,
+    base_url: Url,
     content_gate: Arc<ContentRequestGate>,
 }
 
@@ -50,10 +55,20 @@ impl fmt::Display for Status {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Article {
+#[derive(Debug, Deserialize)]
+pub(crate) struct Item {
     pub(crate) id: String,
     pub(crate) title: String,
+    url: String,
+    processing_status: String,
+    #[serde(default)]
+    markdown: Option<String>,
+}
+
+pub(crate) struct ListOptions {
+    pub(crate) statuses: Vec<Status>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) limit: usize,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +78,9 @@ pub(crate) enum Error {
 
     #[error("at least one Matter item status is required")]
     MissingStatus,
+
+    #[error("Matter indicated more items without a pagination cursor")]
+    MissingCursor,
 
     #[error("Matter API request failed")]
     Request(#[from] reqwest::Error),
@@ -117,46 +135,80 @@ impl Client {
         Self {
             http: HttpClient::new(),
             token,
+            base_url: Url::parse(API_BASE_URL).expect("the Matter API base URL is valid"),
             content_gate: Arc::new(ContentRequestGate::new()),
         }
     }
 
-    pub(crate) async fn articles(
+    pub(crate) fn list_items(
         &self,
-        statuses: impl IntoIterator<Item = Status>,
-        tags: impl IntoIterator<Item = String>,
-        limit: usize,
-    ) -> Result<Vec<Article>, Error> {
-        let statuses = comma_separated(statuses).ok_or(Error::MissingStatus)?;
-        let tags = comma_separated(tags);
-        let limit = limit.to_string();
-        let request = self
-            .http
-            .get(format!("{API_BASE_URL}/items"))
-            .bearer_auth(&self.token)
-            .query(&[
-                ("status", statuses.as_str()),
-                ("content_type", "article"),
-                ("limit", limit.as_str()),
-            ]);
-        let request = match tags.as_deref() {
-            Some(tags) => request.query(&[("tag", tags)]),
-            None => request,
-        };
-        let listed: ItemList = request.send().await?.error_for_status()?.json().await?;
+        options: ListOptions,
+    ) -> impl Stream<Item = Result<Item, Error>> + '_ {
+        try_stream! {
+            let statuses =
+                comma_separated(options.statuses).ok_or(Error::MissingStatus)?;
+            let tags = comma_separated(options.tags);
+            let mut remaining = options.limit;
+            let mut cursor = None;
 
-        Ok(listed
-            .results
-            .into_iter()
-            .map(|item| Article {
-                id: item.id,
-                title: item.title.trim().to_owned(),
-            })
-            .collect())
+            while remaining > 0 {
+                let page_limit = remaining.min(MAX_ITEMS_PER_PAGE).to_string();
+                let mut request = self
+                    .http
+                    .get(self.endpoint("items"))
+                    .bearer_auth(&self.token)
+                    .query(&[
+                        ("status", statuses.as_str()),
+                        ("content_type", "article"),
+                        ("limit", page_limit.as_str()),
+                    ]);
+
+                if let Some(tags) = tags.as_deref() {
+                    request = request.query(&[("tag", tags)]);
+                }
+                if let Some(cursor) = cursor.as_deref() {
+                    request = request.query(&[("cursor", cursor)]);
+                }
+
+                let page: ItemList = request.send().await?.error_for_status()?.json().await?;
+
+                for item in page.results.into_iter().take(remaining) {
+                    remaining -= 1;
+                    yield item;
+                }
+
+                if remaining == 0 || !page.has_more {
+                    break;
+                }
+
+                cursor = Some(page.next_cursor.ok_or(Error::MissingCursor)?);
+            }
+        }
     }
 
-    pub(crate) async fn fetch_document(&self, id: &str) -> Result<Document, Error> {
-        self.item(id).await?.into_document()
+    pub(crate) fn list_items_with_markdown(
+        &self,
+        options: ListOptions,
+    ) -> impl Stream<Item = Result<(Item, Result<(), Error>), Error>> + '_ {
+        let client = self.clone();
+
+        self.list_items(options)
+            .map(move |listed| {
+                let client = client.clone();
+
+                async move {
+                    let mut item = listed?;
+                    let outcome = client.include_markdown(&mut item).await;
+                    Ok::<_, Error>((item, outcome))
+                }
+            })
+            .buffered(MAX_CONCURRENT_CONTENT_REQUESTS)
+    }
+
+    async fn include_markdown(&self, item: &mut Item) -> Result<(), Error> {
+        item.ensure_processed()?;
+        *item = self.item(&item.id).await?;
+        item.ensure_markdown_available()
     }
 
     async fn item(&self, id: &str) -> Result<Item, Error> {
@@ -165,7 +217,7 @@ impl Client {
 
             let response = self
                 .http
-                .get(format!("{API_BASE_URL}/items/{id}"))
+                .get(self.endpoint(&format!("items/{id}")))
                 .bearer_auth(&self.token)
                 .query(&[("include", "markdown")])
                 .send()
@@ -190,6 +242,12 @@ impl Client {
         }
 
         unreachable!("a bounded retry loop always returns")
+    }
+
+    fn endpoint(&self, path: &str) -> Url {
+        self.base_url
+            .join(path)
+            .expect("Matter API paths are valid URL references")
     }
 }
 
@@ -216,26 +274,39 @@ fn retry_after(headers: &HeaderMap) -> Duration {
 
 #[derive(Deserialize)]
 struct ItemList {
-    results: Vec<ItemSummary>,
-}
-
-#[derive(Deserialize)]
-struct ItemSummary {
-    id: String,
-    title: String,
-}
-
-#[derive(Deserialize)]
-struct Item {
-    id: String,
-    title: String,
-    url: String,
-    processing_status: String,
-    markdown: Option<String>,
+    results: Vec<Item>,
+    has_more: bool,
+    next_cursor: Option<String>,
 }
 
 impl Item {
-    fn into_document(self) -> Result<Document, Error> {
+    fn ensure_processed(&self) -> Result<(), Error> {
+        if self.processing_status != "completed" {
+            return Err(Error::Unavailable {
+                reason: format!("content extraction is {}", self.processing_status),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_markdown_available(&self) -> Result<(), Error> {
+        self.ensure_processed()?;
+
+        if self
+            .markdown
+            .as_ref()
+            .is_none_or(|markdown| markdown.trim().is_empty())
+        {
+            return Err(Error::Unavailable {
+                reason: "Matter returned no extracted Markdown".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn into_document(self) -> Result<(String, Document), Error> {
         let Self {
             id,
             title,
@@ -243,7 +314,10 @@ impl Item {
             processing_status,
             markdown,
         } = self;
-        let url = Url::parse(&url).map_err(|source| Error::InvalidUrl { id, source })?;
+        let url = match Url::parse(&url) {
+            Ok(url) => url,
+            Err(source) => return Err(Error::InvalidUrl { id, source }),
+        };
         let title = title.trim().to_owned();
 
         if processing_status != "completed" {
@@ -258,19 +332,35 @@ impl Item {
             });
         };
 
-        Ok(Document {
-            title: Some(title),
-            url: Some(url),
-            text: markdown,
-        })
+        Ok((
+            id,
+            Document {
+                title: Some(title),
+                url: Some(url),
+                text: markdown,
+            },
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_RETRY_AFTER, Error, Item, Status, comma_separated, retry_after};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::Arc,
+        thread,
+        time::Duration,
+    };
+
+    use futures_util::{StreamExt, pin_mut};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-    use std::time::Duration;
+    use url::Url;
+
+    use super::{
+        Client, ContentRequestGate, DEFAULT_RETRY_AFTER, Error, Item, ListOptions, Status,
+        comma_separated, retry_after,
+    };
 
     #[test]
     fn filter_values_are_serialized_for_api_queries() {
@@ -283,6 +373,112 @@ mod tests {
             Some("tag_one,tag_two")
         );
         assert_eq!(comma_separated::<Status>([]).as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn list_items_follows_pagination_until_the_requested_limit() {
+        let (base_url, server) = pagination_server();
+        let client = Client {
+            http: reqwest::Client::new(),
+            token: "secret-token".to_owned(),
+            base_url,
+            content_gate: Arc::new(ContentRequestGate::new()),
+        };
+        let items = client.list_items(ListOptions {
+            statuses: vec![Status::Queue],
+            tags: Vec::new(),
+            limit: 2,
+        });
+        pin_mut!(items);
+
+        let first = items.next().await.unwrap().unwrap();
+        let second = items.next().await.unwrap().unwrap();
+
+        assert_eq!(first.id, "itm_first");
+        assert_eq!(second.id, "itm_second");
+        assert!(items.next().await.is_none());
+        server.join().unwrap();
+    }
+
+    fn pagination_server() -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let responses = [
+                r#"{
+                    "results": [{
+                        "id": "itm_first",
+                        "title": "First",
+                        "url": "https://example.com/first",
+                        "processing_status": "completed"
+                    }],
+                    "has_more": true,
+                    "next_cursor": "next"
+                }"#,
+                r#"{
+                    "results": [{
+                        "id": "itm_second",
+                        "title": "Second",
+                        "url": "https://example.com/second",
+                        "processing_status": "completed"
+                    }],
+                    "has_more": false,
+                    "next_cursor": null
+                }"#,
+            ];
+
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert!(request.starts_with("GET /items?"));
+                assert!(request.contains(if index == 0 { "limit=2" } else { "limit=1" }));
+                if index == 1 {
+                    assert!(request.contains("cursor=next"));
+                }
+                write_response(&mut stream, response);
+            }
+        });
+
+        (Url::parse(&format!("http://{address}/")).unwrap(), server)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            assert!(bytes_read > 0, "connection closed before request completed");
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn listed_item_can_omit_markdown() {
+        let item: Item = serde_json::from_str(
+            r#"{
+                "id": "itm_123",
+                "title": "A saved article",
+                "url": "https://example.com/article",
+                "processing_status": "completed"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(item.markdown.is_none());
     }
 
     #[test]
@@ -298,7 +494,7 @@ mod tests {
         )
         .unwrap();
 
-        let document = item.into_document().unwrap();
+        let (_, document) = item.into_document().unwrap();
 
         assert_eq!(document.title.as_deref(), Some("A saved article"));
         assert_eq!(
