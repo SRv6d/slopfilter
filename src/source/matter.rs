@@ -14,7 +14,7 @@ use reqwest::{
     Client as HttpClient, StatusCode,
     header::{HeaderMap, RETRY_AFTER},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tokio::{
     sync::Mutex,
@@ -59,7 +59,8 @@ impl fmt::Display for Status {
 pub(crate) struct Item {
     pub(crate) id: String,
     pub(crate) title: String,
-    url: String,
+    #[serde(default, deserialize_with = "deserialize_url")]
+    url: Option<Url>,
     processing_status: String,
     #[serde(default)]
     markdown: Option<String>,
@@ -89,23 +90,26 @@ pub(crate) struct ListOptions {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error("Matter document is unavailable: {reason}")]
-    Unavailable { reason: String },
-
     #[error("at least one Matter item status is required")]
     MissingStatus,
 
     #[error("Matter indicated more items without a pagination cursor")]
     MissingCursor,
 
-    #[error("Matter API request failed")]
-    Request(#[from] reqwest::Error),
+    #[error("failed to fetch Matter items")]
+    Fetch(#[from] reqwest::Error),
+}
 
-    #[error("Matter item {id} has an invalid URL")]
-    InvalidUrl {
+#[derive(Debug, Error)]
+pub(crate) enum ItemError {
+    #[error("Matter document is unavailable: {reason}")]
+    Unavailable { reason: String },
+
+    #[error("failed to fetch Matter item {id}")]
+    Fetch {
         id: String,
         #[source]
-        source: url::ParseError,
+        source: reqwest::Error,
     },
 
     #[error("Matter rate limit persisted while fetching {id} after {retries} retries")]
@@ -214,7 +218,7 @@ impl Client {
     pub(crate) fn list_items_with_markdown(
         &self,
         options: ListOptions,
-    ) -> impl Stream<Item = Result<(Item, Result<(), Error>), Error>> + '_ {
+    ) -> impl Stream<Item = Result<(Item, Result<(), ItemError>), Error>> + '_ {
         let client = self.clone();
 
         self.list_items(options)
@@ -230,13 +234,13 @@ impl Client {
             .buffered(MAX_CONCURRENT_CONTENT_REQUESTS)
     }
 
-    async fn include_markdown(&self, item: &mut Item) -> Result<(), Error> {
+    async fn include_markdown(&self, item: &mut Item) -> Result<(), ItemError> {
         item.ensure_processed()?;
         *item = self.item(&item.id).await?;
         item.ensure_markdown_available()
     }
 
-    async fn item(&self, id: &str) -> Result<Item, Error> {
+    async fn item(&self, id: &str) -> Result<Item, ItemError> {
         for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
             self.content_gate.acquire().await;
 
@@ -246,7 +250,11 @@ impl Client {
                 .bearer_auth(&self.token)
                 .query(&[("include", "markdown")])
                 .send()
-                .await?;
+                .await
+                .map_err(|source| ItemError::Fetch {
+                    id: id.to_owned(),
+                    source,
+                })?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 self.content_gate
@@ -254,7 +262,7 @@ impl Client {
                     .await;
 
                 if attempt == MAX_RATE_LIMIT_RETRIES {
-                    return Err(Error::RateLimited {
+                    return Err(ItemError::RateLimited {
                         id: id.to_owned(),
                         retries: MAX_RATE_LIMIT_RETRIES,
                     });
@@ -263,7 +271,16 @@ impl Client {
                 continue;
             }
 
-            return Ok(response.error_for_status()?.json().await?);
+            let response = response
+                .error_for_status()
+                .map_err(|source| ItemError::Fetch {
+                    id: id.to_owned(),
+                    source,
+                })?;
+            return response.json().await.map_err(|source| ItemError::Fetch {
+                id: id.to_owned(),
+                source,
+            });
         }
 
         unreachable!("a bounded retry loop always returns")
@@ -297,6 +314,14 @@ fn retry_after(headers: &HeaderMap) -> Duration {
         .unwrap_or(DEFAULT_RETRY_AFTER)
 }
 
+fn deserialize_url<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| Url::parse(&value).ok()))
+}
+
 #[derive(Deserialize)]
 struct ItemList {
     results: Vec<Item>,
@@ -305,9 +330,9 @@ struct ItemList {
 }
 
 impl Item {
-    fn ensure_processed(&self) -> Result<(), Error> {
+    fn ensure_processed(&self) -> Result<(), ItemError> {
         if self.processing_status != "completed" {
-            return Err(Error::Unavailable {
+            return Err(ItemError::Unavailable {
                 reason: format!("content extraction is {}", self.processing_status),
             });
         }
@@ -315,7 +340,7 @@ impl Item {
         Ok(())
     }
 
-    fn ensure_markdown_available(&self) -> Result<(), Error> {
+    fn ensure_markdown_available(&self) -> Result<(), ItemError> {
         self.ensure_processed()?;
 
         if self
@@ -323,7 +348,7 @@ impl Item {
             .as_ref()
             .is_none_or(|markdown| markdown.trim().is_empty())
         {
-            return Err(Error::Unavailable {
+            return Err(ItemError::Unavailable {
                 reason: "Matter returned no extracted Markdown".to_owned(),
             });
         }
@@ -331,7 +356,7 @@ impl Item {
         Ok(())
     }
 
-    pub(crate) fn into_document(self) -> Result<(String, Document), Error> {
+    pub(crate) fn into_document(self) -> Result<(String, Document), ItemError> {
         let Self {
             id,
             title,
@@ -339,20 +364,16 @@ impl Item {
             processing_status,
             markdown,
         } = self;
-        let url = match Url::parse(&url) {
-            Ok(url) => url,
-            Err(source) => return Err(Error::InvalidUrl { id, source }),
-        };
         let title = title.trim().to_owned();
 
         if processing_status != "completed" {
-            return Err(Error::Unavailable {
+            return Err(ItemError::Unavailable {
                 reason: format!("content extraction is {processing_status}"),
             });
         }
 
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
-            return Err(Error::Unavailable {
+            return Err(ItemError::Unavailable {
                 reason: "Matter returned no extracted Markdown".to_owned(),
             });
         };
@@ -361,7 +382,7 @@ impl Item {
             id,
             Document {
                 title: Some(title),
-                url: Some(url),
+                url,
                 text: markdown,
             },
         ))
@@ -383,7 +404,7 @@ mod tests {
     use url::Url;
 
     use super::{
-        Client, ContentRequestGate, DEFAULT_RETRY_AFTER, Error, Item, ListOptions, Status,
+        Client, ContentRequestGate, DEFAULT_RETRY_AFTER, Item, ItemError, ListOptions, Status,
         comma_separated, retry_after,
     };
 
@@ -460,6 +481,55 @@ mod tests {
         assert!(items.next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn content_fetch_failure_remains_item_scoped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("GET /items?"));
+            write_response(
+                &mut stream,
+                r#"{
+                    "results": [{
+                        "id": "itm_first",
+                        "title": "First",
+                        "url": "https://example.com/first",
+                        "processing_status": "completed"
+                    }],
+                    "has_more": false,
+                    "next_cursor": null
+                }"#,
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("GET /items/itm_first?include=markdown"));
+            write_status_response(&mut stream, "500 Internal Server Error", "{}");
+        });
+        let client = Client {
+            http: reqwest::Client::new(),
+            token: "secret-token".to_owned(),
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            content_gate: Arc::new(ContentRequestGate::new()),
+        };
+        let items = client.list_items_with_markdown(ListOptions {
+            status: vec![Status::Queue],
+            tag: Vec::new(),
+            limit: None,
+        });
+        pin_mut!(items);
+
+        let (item, outcome) = items.next().await.unwrap().unwrap();
+
+        assert_eq!(item.id, "itm_first");
+        assert!(matches!(
+            outcome,
+            Err(ItemError::Fetch { id, .. }) if id == "itm_first"
+        ));
+        assert!(items.next().await.is_none());
+        server.join().unwrap();
+    }
+
     fn pagination_server(expected_limits: [&'static str; 2]) -> (Url, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -518,9 +588,13 @@ mod tests {
     }
 
     fn write_response(stream: &mut TcpStream, body: &str) {
+        write_status_response(stream, "200 OK", body);
+    }
+
+    fn write_status_response(stream: &mut TcpStream, status: &str, body: &str) {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -566,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn item_with_an_invalid_url_fails() {
+    fn item_with_an_invalid_url_keeps_its_document() {
         let item: Item = serde_json::from_str(
             r#"{
                 "id": "itm_123",
@@ -578,10 +652,28 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            item.into_document(),
-            Err(Error::InvalidUrl { id, .. }) if id == "itm_123"
-        ));
+        let (_, document) = item.into_document().unwrap();
+
+        assert_eq!(document.url, None);
+        assert_eq!(document.text, "Article body");
+    }
+
+    #[test]
+    fn item_without_a_url_keeps_its_document() {
+        let item: Item = serde_json::from_str(
+            r#"{
+                "id": "itm_123",
+                "title": "A saved article",
+                "processing_status": "completed",
+                "markdown": "Article body"
+            }"#,
+        )
+        .unwrap();
+
+        let (_, document) = item.into_document().unwrap();
+
+        assert_eq!(document.url, None);
+        assert_eq!(document.text, "Article body");
     }
 
     #[test]
@@ -599,7 +691,7 @@ mod tests {
 
         assert!(matches!(
             item.into_document(),
-            Err(Error::Unavailable { reason }) if reason == "content extraction is processing"
+            Err(ItemError::Unavailable { reason }) if reason == "content extraction is processing"
         ));
     }
 
@@ -618,7 +710,7 @@ mod tests {
 
         assert!(matches!(
             item.into_document(),
-            Err(Error::Unavailable { reason })
+            Err(ItemError::Unavailable { reason })
                 if reason == "Matter returned no extracted Markdown"
         ));
     }

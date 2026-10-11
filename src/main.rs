@@ -161,7 +161,10 @@ async fn score_matter(
         scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
     let client = matter::Client::new(matter_api_token);
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<
-        std::result::Result<(matter::Item, std::result::Result<(), matter::Error>), matter::Error>,
+        std::result::Result<
+            (matter::Item, std::result::Result<(), matter::ItemError>),
+            matter::Error,
+        >,
     >(MAX_BUFFERED_MATTER_ITEMS);
     let producer = tokio::spawn(async move {
         let items = client.list_items_with_markdown(list_options);
@@ -211,7 +214,7 @@ async fn score_matter(
                         .context("total word count overflowed")?;
                     available += 1;
                 }
-                Err(matter::Error::Unavailable { reason }) => {
+                Err(matter::ItemError::Unavailable { reason }) => {
                     eprintln!("{}", format_unavailable(&item, &reason, color));
                 }
                 Err(error) => {
