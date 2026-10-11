@@ -31,6 +31,19 @@ Implemented:
   devcontainer installs the exported Rust toolchain into the Nix profile for
   the VS Code extension host.
 
+### Matter concurrency constraints
+
+- Listing and Markdown hydration run in a producer task while the consumer
+  awaits Pangram scoring, so source I/O and scoring can overlap.
+- At most four Matter content requests are in flight. Buffered hydration
+  preserves Matter list order even when later requests finish first.
+- The producer-to-consumer channel holds at most four hydrated outcomes. A full
+  channel applies backpressure to listing and hydration instead of allowing
+  unbounded read-ahead.
+- Word-budget admission and Pangram submission remain ordered and single-flight.
+- Stopping at the word budget drops the consumer and aborts the producer;
+  bounded prefetched hydration may therefore be discarded.
+
 Not implemented:
 
 - No Atom/RSS CLI command or shared source orchestration.
