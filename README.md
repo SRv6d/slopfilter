@@ -4,36 +4,39 @@
 
 ## Usage
 
-Set `MATTER_API_TOKEN`, then inspect queued articles without contacting Pangram:
-
 ```console
-$ slopfilter matter --limit 20 --dry-run
-$ slopfilter matter --status inbox --limit 20 --dry-run
-$ slopfilter matter --status inbox --status queue --limit 20 --dry-run
-$ slopfilter matter --tag tag_n5j2x --limit 20 --dry-run
+$ slopfilter --help
+Inspect and score text for likely AI authorship
+
+Usage: slopfilter <COMMAND>
+
+Commands:
+  matter  Score Matter articles
+  file    Score a UTF-8 text or Markdown file
+  stdin   Score UTF-8 text piped on standard input
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 ```
 
-`--status` accepts `inbox`, `queue`, and `archive`; repeat the option to select
-multiple statuses. It defaults to `queue`.
-`--tag` accepts Matter tag IDs; repeat the option to match any selected tag.
-`--limit` caps the total items across pages; omit it to scan every match.
-
-Dry runs follow the same cumulative word budget without contacting Pangram and
-do not require `PANGRAM_API_KEY`. They also work for files and standard input:
+Each subcommand documents its own options:
 
 ```console
-$ slopfilter file article.md --dry-run
-$ cat article.md | slopfilter stdin --dry-run
-```
+$ slopfilter matter --help
+Score Matter articles
 
-Without `--dry-run`, scoring is billable and requires `PANGRAM_API_KEY`.
-Matter streams matching articles, hydrates up to four Markdown bodies
-concurrently while respecting its burst limit and `Retry-After`, and preserves
-the listed order for scoring. Each eligible article is submitted through
-Pangram's realtime task API.
+Usage: slopfilter matter [OPTIONS] --matter-api-token <TOKEN>
 
-```console
-$ slopfilter matter --limit 20 --max-words 10000
+Options:
+      --status <STATUS>           Filter items by status [default: queue] [possible values: inbox, queue, archive]
+      --tag <TAG>                 Filter items by their tag
+      --limit <LIMIT>             The maximum number of items to score
+      --matter-api-token <TOKEN>  The Matter API token [env: MATTER_API_TOKEN]
+      --max-words <MAX_WORDS>     The maximum total number of words authorized for this invocation [default: 2000]
+      --dry-run                   Inspect inputs without submitting to Pangram
+      --pangram-api-key <KEY>     The Pangram API key [env: PANGRAM_API_KEY]
+  -h, --help                      Print help
 ```
 
 [Matter]: https://www.getmatter.com
