@@ -492,20 +492,74 @@ fn required_string(value: Option<String>, context: &str, field: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread,
-    };
-
     use super::{BulkInput, BulkItemOutcome};
-    use crate::pangram::Client;
-    use url::Url;
+    use crate::pangram::{
+        Client,
+        test_support::{Response, ScriptedServer, assert_api_key, assert_request},
+    };
 
     #[tokio::test]
     async fn client_submits_polls_and_returns_individual_results() {
-        let (base_url, server) = bulk_lifecycle_server();
-        let client = Client::with_base_url("secret-key".to_owned(), base_url);
+        let server = ScriptedServer::start([
+            Response::ok(
+                r#"{
+                    "bulk_id":"bulk-123",
+                    "status":"queued",
+                    "total_items":2,
+                    "accepted_items":[
+                        {"index":0,"id":"item-first","task_id":"task-first"},
+                        {"index":1,"id":"item-second","task_id":"task-second"}
+                    ],
+                    "failed_items":[]
+                }"#,
+            ),
+            Response::ok(
+                r#"{
+                    "bulk_id":"bulk-123",
+                    "status":"running",
+                    "total_items":2,
+                    "accepted":2,
+                    "succeeded":0,
+                    "failed":0
+                }"#,
+            ),
+            Response::ok(
+                r#"{
+                    "bulk_id":"bulk-123",
+                    "status":"partial",
+                    "total_items":2,
+                    "accepted":2,
+                    "succeeded":1,
+                    "failed":1
+                }"#,
+            ),
+            Response::ok(format!(
+                r#"{{
+                    "bulk_id":"bulk-123",
+                    "offset":0,
+                    "limit":1000,
+                    "total_items":2,
+                    "items":[{{
+                        "index":0,
+                        "id":"item-first",
+                        "task_id":"task-first",
+                        "stage":"STAGE_SUCCESS",
+                        "error":null,
+                        "result":{}
+                    }}],
+                    "failed_items":[{{
+                        "index":1,
+                        "id":"item-second",
+                        "task_id":"task-second",
+                        "stage":"STAGE_FAILED",
+                        "error":"invalid text"
+                    }}]
+                }}"#,
+                score_response("First article")
+            )),
+        ])
+        .await;
+        let client = Client::with_base_url("secret-key".to_owned(), server.base_url());
         let inputs = [
             BulkInput {
                 id: "item-first",
@@ -520,7 +574,29 @@ mod tests {
         let submission = client.submit_bulk(&inputs, "pangram-4").await.unwrap();
         assert!(submission.failed.is_empty());
         let outcomes = client.wait_for_bulk(&submission.handle).await.unwrap();
-        server.join().unwrap();
+        let requests = server.finish().await;
+
+        assert_api_key(&requests, "secret-key");
+        assert_request(&requests[0], "POST", "/bulk");
+        assert_request(&requests[1], "GET", "/bulk/bulk-123");
+        assert_request(&requests[2], "GET", "/bulk/bulk-123");
+        assert_request(&requests[3], "GET", "/bulk/bulk-123/results");
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["model"], "pangram-4");
+        assert_eq!(body["items"][0]["id"], "item-first");
+        assert_eq!(body["items"][1]["text"], "Second article");
+        assert!(
+            requests[3]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "offset" && value == "0")
+        );
+        assert!(
+            requests[3]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "limit" && value == "1000")
+        );
 
         assert!(outcomes.iter().any(|outcome| matches!(
             outcome,
@@ -532,94 +608,6 @@ mod tests {
             BulkItemOutcome::Complete { id, score }
                 if id == "item-first" && score.task_id == "task-first"
         )));
-    }
-
-    fn bulk_lifecycle_server() -> (Url, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let server = thread::spawn(move || {
-            let responses = [
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"queued",
-                    "total_items":2,
-                    "accepted_items":[
-                        {"index":0,"id":"item-first","task_id":"task-first"},
-                        {"index":1,"id":"item-second","task_id":"task-second"}
-                    ],
-                    "failed_items":[]
-                }"#,
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"running",
-                    "total_items":2,
-                    "accepted":2,
-                    "succeeded":0,
-                    "failed":0
-                }"#,
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"partial",
-                    "total_items":2,
-                    "accepted":2,
-                    "succeeded":1,
-                    "failed":1
-                }"#,
-                &format!(
-                    r#"{{
-                        "bulk_id":"bulk-123",
-                        "offset":0,
-                        "limit":1000,
-                        "total_items":2,
-                        "items":[{{
-                            "index":0,
-                            "id":"item-first",
-                            "task_id":"task-first",
-                            "stage":"STAGE_SUCCESS",
-                            "error":null,
-                            "result":{}
-                        }}],
-                        "failed_items":[{{
-                            "index":1,
-                            "id":"item-second",
-                            "task_id":"task-second",
-                            "stage":"STAGE_FAILED",
-                            "error":"invalid text"
-                        }}]
-                    }}"#,
-                    score_response("First article")
-                ),
-            ];
-
-            for (index, response) in responses.into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                assert!(
-                    request
-                        .to_ascii_lowercase()
-                        .contains("x-api-key: secret-key")
-                );
-                match index {
-                    0 => {
-                        assert!(request.starts_with("POST /bulk HTTP/1.1"));
-                        let (_, body) = request.split_once("\r\n\r\n").unwrap();
-                        let body: serde_json::Value = serde_json::from_str(body).unwrap();
-                        assert_eq!(body["model"], "pangram-4");
-                        assert_eq!(body["items"][0]["id"], "item-first");
-                        assert_eq!(body["items"][1]["text"], "Second article");
-                    }
-                    1 | 2 => assert!(request.starts_with("GET /bulk/bulk-123 HTTP/1.1")),
-                    3 => {
-                        assert!(request.starts_with("GET /bulk/bulk-123/results?"));
-                        assert!(request.contains("offset=0"));
-                        assert!(request.contains("limit=1000"));
-                    }
-                    _ => unreachable!(),
-                }
-                write_response(&mut stream, response);
-            }
-        });
-        (base_url, server)
     }
 
     fn score_response(text: &str) -> String {
@@ -640,41 +628,5 @@ mod tests {
                 "windows":[]
             }}"#
         )
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4096];
-        loop {
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            assert!(bytes_read > 0, "connection closed before request completed");
-            request.extend_from_slice(&buffer[..bytes_read]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            if request.len() >= body_start + content_length {
-                request.truncate(body_start + content_length);
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
-
-    fn write_response(stream: &mut TcpStream, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
     }
 }

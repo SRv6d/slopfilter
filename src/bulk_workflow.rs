@@ -614,14 +614,8 @@ fn finish(items: &[ItemRun]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread,
-    };
-
     use super::*;
-    use url::Url;
+    use crate::pangram::test_support::{Response, ScriptedServer, assert_api_key, assert_request};
 
     #[test]
     fn matter_admission_uses_estimates_then_rechecks_actual_counts() {
@@ -703,26 +697,35 @@ mod tests {
 
     #[tokio::test]
     async fn sequential_jobs_submit_poll_and_apply_item_results() {
-        let (base_url, server) = sequential_bulk_server();
-        let client = pangram::Client::with_base_url("secret-key".to_owned(), base_url);
+        let server = ScriptedServer::start(sequential_bulk_responses()).await;
+        let client = pangram::Client::with_base_url("secret-key".to_owned(), server.base_url());
         let mut items = vec![prepared_item("first", 100_000), prepared_item("second", 1)];
         let jobs = partition(&mut items, false);
 
         execute_jobs(&client, "pangram-4", &jobs, &mut items, false)
             .await
             .unwrap();
-        server.join().unwrap();
+        let requests = server.finish().await;
 
         assert_eq!(jobs.len(), 2);
         assert_eq!(items[0].state, ItemState::Completed);
         assert_eq!(items[1].state, ItemState::Failed);
+        assert_api_key(&requests, "secret-key");
+        assert_request(&requests[0], "POST", "/bulk");
+        assert_request(&requests[1], "GET", "/bulk/bulk-first");
+        assert_request(&requests[2], "GET", "/bulk/bulk-first/results");
+        assert_request(&requests[3], "POST", "/bulk");
+        assert_request(&requests[4], "GET", "/bulk/bulk-second");
+        assert_request(&requests[5], "GET", "/bulk/bulk-second/results");
+        let first: serde_json::Value = requests[0].body_json().unwrap();
+        let second: serde_json::Value = requests[3].body_json().unwrap();
+        assert_eq!(first["items"][0]["id"], "first");
+        assert_eq!(second["items"][0]["id"], "second");
     }
 
-    fn sequential_bulk_server() -> (Url, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let server = thread::spawn(move || {
-            let responses = vec![
+    fn sequential_bulk_responses() -> [Response; 6] {
+        [
+            Response::ok(
                 r#"{
                     "bulk_id":"bulk-first",
                     "status":"queued",
@@ -731,8 +734,9 @@ mod tests {
                         {"index":0,"id":"first","task_id":"task-first"}
                     ],
                     "failed_items":[]
-                }"#
-                .to_owned(),
+                }"#,
+            ),
+            Response::ok(
                 r#"{
                     "bulk_id":"bulk-first",
                     "status":"succeeded",
@@ -740,26 +744,27 @@ mod tests {
                     "accepted":1,
                     "succeeded":1,
                     "failed":0
-                }"#
-                .to_owned(),
-                format!(
-                    r#"{{
-                        "bulk_id":"bulk-first",
-                        "offset":0,
-                        "limit":1000,
-                        "total_items":1,
-                        "items":[{{
-                            "index":0,
-                            "id":"first",
-                            "task_id":"task-first",
-                            "stage":"STAGE_SUCCESS",
-                            "error":null,
-                            "result":{}
-                        }}],
-                        "failed_items":[]
-                    }}"#,
-                    score_response("first")
-                ),
+                }"#,
+            ),
+            Response::ok(format!(
+                r#"{{
+                    "bulk_id":"bulk-first",
+                    "offset":0,
+                    "limit":1000,
+                    "total_items":1,
+                    "items":[{{
+                        "index":0,
+                        "id":"first",
+                        "task_id":"task-first",
+                        "stage":"STAGE_SUCCESS",
+                        "error":null,
+                        "result":{}
+                    }}],
+                    "failed_items":[]
+                }}"#,
+                score_response("first")
+            )),
+            Response::ok(
                 r#"{
                     "bulk_id":"bulk-second",
                     "status":"queued",
@@ -768,8 +773,9 @@ mod tests {
                         {"index":0,"id":"second","task_id":"task-second"}
                     ],
                     "failed_items":[]
-                }"#
-                .to_owned(),
+                }"#,
+            ),
+            Response::ok(
                 r#"{
                     "bulk_id":"bulk-second",
                     "status":"failed",
@@ -777,8 +783,9 @@ mod tests {
                     "accepted":1,
                     "succeeded":0,
                     "failed":1
-                }"#
-                .to_owned(),
+                }"#,
+            ),
+            Response::ok(
                 r#"{
                     "bulk_id":"bulk-second",
                     "offset":0,
@@ -792,36 +799,9 @@ mod tests {
                         "stage":"STAGE_FAILED",
                         "error":"invalid text"
                     }]
-                }"#
-                .to_owned(),
-            ];
-
-            for (index, response) in responses.into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                match index {
-                    0 => {
-                        assert!(request.starts_with("POST /bulk HTTP/1.1"));
-                        assert!(request.contains(r#""id":"first""#));
-                    }
-                    1 => assert!(request.starts_with("GET /bulk/bulk-first HTTP/1.1")),
-                    2 => {
-                        assert!(request.starts_with("GET /bulk/bulk-first/results?"));
-                    }
-                    3 => {
-                        assert!(request.starts_with("POST /bulk HTTP/1.1"));
-                        assert!(request.contains(r#""id":"second""#));
-                    }
-                    4 => assert!(request.starts_with("GET /bulk/bulk-second HTTP/1.1")),
-                    5 => {
-                        assert!(request.starts_with("GET /bulk/bulk-second/results?"));
-                    }
-                    _ => unreachable!(),
-                }
-                write_response(&mut stream, &response);
-            }
-        });
-        (base_url, server)
+                }"#,
+            ),
+        ]
     }
 
     fn score_response(text: &str) -> String {
@@ -842,42 +822,6 @@ mod tests {
                 "windows":[]
             }}"#
         )
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4096];
-        loop {
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            assert!(bytes_read > 0, "connection closed before request completed");
-            request.extend_from_slice(&buffer[..bytes_read]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            if request.len() >= body_start + content_length {
-                request.truncate(body_start + content_length);
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
-
-    fn write_response(stream: &mut TcpStream, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
     }
 
     fn prepared_item(id: &str, words: usize) -> ItemRun {
