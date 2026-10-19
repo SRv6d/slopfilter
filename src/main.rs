@@ -9,7 +9,8 @@ use std::{
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
-use source::{Document, matter};
+use futures_util::{StreamExt, pin_mut};
+use source::{Document, feed, matter};
 use url::Url;
 
 pub mod scoring;
@@ -177,11 +178,140 @@ async fn main() -> Result<()> {
             list_options,
             matter_api_token,
             global,
-        } => scoring::score_matter(matter_api_token, list_options, global).await,
-        ScoreInput::Feed { url, global } => scoring::score_feed(url, global).await,
+        } => score_matter(matter_api_token, list_options, global).await,
+        ScoreInput::Feed { url, global } => score_feed(url, global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
     }
+}
+
+async fn score_matter(
+    matter_api_token: String,
+    list_options: matter::ListOptions,
+    global: GlobalArgs,
+) -> Result<()> {
+    let color = color_enabled();
+    let client = matter::Client::new(matter_api_token);
+    let listed = client.list_items(list_options);
+    pin_mut!(listed);
+    let mut candidates = Vec::new();
+
+    while let Some(item) = listed.next().await {
+        let item = item.context("failed to list Matter items")?;
+        let scoring_item =
+            scoring::ScoringItem::new("Matter", item.id.clone(), Some(item.title.clone()));
+        candidates.push((item, scoring_item));
+    }
+
+    for (_, item) in &mut candidates {
+        item.pending(color);
+    }
+
+    let mut estimates = Vec::new();
+    for (index, (matter_item, scoring_item)) in candidates.iter_mut().enumerate() {
+        match matter_item.estimated_word_count() {
+            Ok(words) => estimates.push((index, words)),
+            Err(matter::ItemError::Unavailable { reason }) => {
+                scoring_item.unavailable(reason, color);
+            }
+            Err(error) => scoring_item.failed(error, color),
+        }
+    }
+    let initial = scoring::admit_in_order(estimates, global.max_words);
+    for (index, exhausted) in initial.skipped {
+        candidates[index].1.budget_skipped(exhausted, color);
+    }
+    for &index in &initial.admitted {
+        candidates[index].1.selected(color);
+    }
+
+    let selected_items = initial
+        .admitted
+        .iter()
+        .map(|&index| &candidates[index].0)
+        .collect::<Vec<_>>();
+    let fetched = client.fetch_documents(&selected_items).await;
+    let mut actual_counts = Vec::new();
+    for (index, document) in initial.admitted.into_iter().zip(fetched) {
+        let item = &mut candidates[index].1;
+        match document {
+            Ok(document) => match item.set_document(document) {
+                Ok(words) => actual_counts.push((index, words)),
+                Err(error) => item.failed(error, color),
+            },
+            Err(matter::ItemError::Unavailable { reason }) => item.unavailable(reason, color),
+            Err(error) => item.failed(error, color),
+        }
+    }
+
+    let actual = scoring::admit_in_order(actual_counts, global.max_words);
+    for (index, exhausted) in actual.skipped {
+        candidates[index].1.budget_skipped(exhausted, color);
+    }
+    for index in actual.admitted {
+        candidates[index].1.prepare(color);
+    }
+
+    let mut items = candidates
+        .into_iter()
+        .map(|(_, scoring_item)| scoring_item)
+        .collect::<Vec<_>>();
+    scoring::execute_source_items(
+        &mut items,
+        global.dry_run,
+        global.pangram_api_key,
+        global.pangram_api_base_url,
+        color,
+    )
+    .await
+}
+
+async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
+    let color = color_enabled();
+    let (mut items, documents): (Vec<_>, Vec<_>) = feed::Client::new()
+        .fetch_documents(feed_url)
+        .await?
+        .into_iter()
+        .map(|(item, document)| {
+            (
+                scoring::ScoringItem::new("Feed", item.id, item.title),
+                document,
+            )
+        })
+        .unzip();
+
+    for item in &mut items {
+        item.pending(color);
+    }
+
+    let mut counts = Vec::new();
+    for (index, (item, document)) in items.iter_mut().zip(documents).enumerate() {
+        match document {
+            Ok(document) => match item.set_document(document) {
+                Ok(words) => counts.push((index, words)),
+                Err(error) => item.failed(error, color),
+            },
+            Err(error @ feed::ItemError::Unavailable) => item.unavailable(error, color),
+            Err(error) => item.failed(error, color),
+        }
+    }
+
+    let admission = scoring::admit_in_order(counts, global.max_words);
+    for (index, exhausted) in admission.skipped {
+        items[index].budget_skipped(exhausted, color);
+    }
+    for index in admission.admitted {
+        items[index].prepare(color);
+    }
+
+    scoring::execute_source_items(
+        &mut items,
+        global.dry_run,
+        global.pangram_api_key,
+        global.pangram_api_base_url,
+        color,
+    )
+    .await
 }
 
 async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {

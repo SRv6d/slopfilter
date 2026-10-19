@@ -4,14 +4,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{StreamExt, pin_mut};
 use url::Url;
 
 use crate::{
-    GlobalArgs, InputDocument, PreparedDocument, color_enabled, display_title, format_document,
-    format_scored_document, render_title,
+    InputDocument, PreparedDocument, display_title, format_document, format_scored_document,
+    render_title,
     scoring::{self, pangram},
-    source::{Document, feed, matter},
+    source::Document,
 };
 
 const PANGRAM_UNIT_WORDS: usize = 100;
@@ -31,9 +30,9 @@ enum ItemState {
     PangramPending,
 }
 
-impl ItemState {
-    fn label(self) -> &'static str {
-        match self {
+impl fmt::Display for ItemState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
             Self::Pending => "Pending",
             Self::Selected => "Selected",
             Self::Prepared => "Prepared",
@@ -44,11 +43,11 @@ impl ItemState {
             Self::Completed => "Completed",
             Self::DryRun => "Dry run",
             Self::PangramPending => "Pangram pending",
-        }
+        })
     }
 }
 
-struct ItemRun {
+pub(crate) struct ScoringItem {
     source: &'static str,
     id: String,
     title: Option<String>,
@@ -58,8 +57,8 @@ struct ItemRun {
     units: Option<usize>,
 }
 
-impl ItemRun {
-    fn new(source: &'static str, id: String, title: Option<String>) -> Self {
+impl ScoringItem {
+    pub(crate) fn new(source: &'static str, id: String, title: Option<String>) -> Self {
         Self {
             source,
             id,
@@ -74,8 +73,7 @@ impl ItemRun {
     fn transition(&mut self, state: ItemState, detail: Option<&dyn fmt::Display>, color: bool) {
         self.state = state;
         eprintln!(
-            "{}: {} · {}: {}",
-            state.label(),
+            "{state}: {} · {}: {}",
             render_title(display_title(self.title.as_deref()), color),
             self.source,
             self.id
@@ -85,19 +83,23 @@ impl ItemRun {
         }
     }
 
-    fn pending(&mut self, color: bool) {
+    pub(crate) fn pending(&mut self, color: bool) {
         self.transition(ItemState::Pending, None, color);
     }
 
-    fn unavailable(&mut self, reason: impl fmt::Display, color: bool) {
+    pub(crate) fn selected(&mut self, color: bool) {
+        self.transition(ItemState::Selected, None, color);
+    }
+
+    pub(crate) fn unavailable(&mut self, reason: impl fmt::Display, color: bool) {
         self.transition(ItemState::Unavailable, Some(&reason), color);
     }
 
-    fn failed(&mut self, error: impl fmt::Display, color: bool) {
+    pub(crate) fn failed(&mut self, error: impl fmt::Display, color: bool) {
         self.transition(ItemState::Failed, Some(&error), color);
     }
 
-    fn budget_skipped(&mut self, exhausted: scoring::BudgetExhausted, color: bool) {
+    pub(crate) fn budget_skipped(&mut self, exhausted: scoring::BudgetExhausted, color: bool) {
         self.document = None;
         let word_noun = if exhausted.remaining_words == 1 {
             "word"
@@ -111,18 +113,19 @@ impl ItemRun {
         self.transition(ItemState::BudgetSkipped, Some(&detail), color);
     }
 
-    fn set_document(&mut self, document: Document) -> Result<(), anyhow::Error> {
+    pub(crate) fn set_document(&mut self, document: Document) -> Result<usize> {
         let prepared = PreparedDocument::new(InputDocument::Item {
             source: self.source,
             item_id: self.id.clone(),
             document,
         })?;
-        self.word_count = Some(prepared.word_count);
+        let word_count = prepared.word_count;
+        self.word_count = Some(word_count);
         self.document = Some(prepared);
-        Ok(())
+        Ok(word_count)
     }
 
-    fn prepare(&mut self, color: bool) {
+    pub(crate) fn prepare(&mut self, color: bool) {
         let words = self
             .word_count
             .expect("an admitted source item has a word count");
@@ -133,20 +136,10 @@ impl ItemRun {
     }
 }
 
-struct MatterCandidate {
-    item: matter::Item,
-    run: ItemRun,
-}
-
-struct FeedCandidate {
-    document: Option<Result<Document, feed::ItemError>>,
-    run: ItemRun,
-}
-
 #[derive(Debug, PartialEq, Eq)]
-struct Admission {
-    admitted: Vec<usize>,
-    skipped: Vec<(usize, scoring::BudgetExhausted)>,
+pub(crate) struct Admission {
+    pub(crate) admitted: Vec<usize>,
+    pub(crate) skipped: Vec<(usize, scoring::BudgetExhausted)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -155,150 +148,10 @@ struct BulkJob {
     units: usize,
 }
 
-pub(crate) async fn score_matter(
-    matter_api_token: String,
-    list_options: matter::ListOptions,
-    global: GlobalArgs,
-) -> Result<()> {
-    let color = color_enabled();
-    let client = matter::Client::new(matter_api_token);
-    let listed = client.list_items(list_options);
-    pin_mut!(listed);
-    let mut candidates = Vec::new();
-
-    while let Some(item) = listed.next().await {
-        let item = item.context("failed to list Matter items")?;
-        let run = ItemRun::new("Matter", item.id.clone(), Some(item.title.clone()));
-        candidates.push(MatterCandidate { item, run });
-    }
-
-    for candidate in &mut candidates {
-        candidate.run.pending(color);
-    }
-
-    let mut estimates = Vec::new();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        match candidate.item.estimated_word_count() {
-            Ok(words) => estimates.push((index, words)),
-            Err(matter::ItemError::Unavailable { reason }) => {
-                candidate.run.unavailable(reason, color);
-            }
-            Err(error) => candidate.run.failed(error, color),
-        }
-    }
-    let initial = admit_in_order(estimates, global.max_words);
-    for (index, exhausted) in initial.skipped {
-        candidates[index].run.budget_skipped(exhausted, color);
-    }
-    for &index in &initial.admitted {
-        candidates[index]
-            .run
-            .transition(ItemState::Selected, None, color);
-    }
-
-    let selected_items = initial
-        .admitted
-        .iter()
-        .map(|&index| &candidates[index].item)
-        .collect::<Vec<_>>();
-    let fetched = client.fetch_documents(&selected_items).await;
-    let mut actual_counts = Vec::new();
-    for (index, document) in initial.admitted.into_iter().zip(fetched) {
-        let run = &mut candidates[index].run;
-        match document {
-            Ok(document) => match run.set_document(document) {
-                Ok(()) => actual_counts.push((index, run.word_count.expect("just prepared"))),
-                Err(error) => run.failed(error, color),
-            },
-            Err(matter::ItemError::Unavailable { reason }) => run.unavailable(reason, color),
-            Err(error) => run.failed(error, color),
-        }
-    }
-
-    let actual = admit_in_order(actual_counts, global.max_words);
-    for (index, exhausted) in actual.skipped {
-        candidates[index].run.budget_skipped(exhausted, color);
-    }
-    for index in actual.admitted {
-        candidates[index].run.prepare(color);
-    }
-
-    let mut items = candidates
-        .into_iter()
-        .map(|candidate| candidate.run)
-        .collect::<Vec<_>>();
-    execute(
-        &mut items,
-        global.dry_run,
-        global.pangram_api_key,
-        global.pangram_api_base_url,
-        color,
-    )
-    .await
-}
-
-pub(crate) async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
-    let color = color_enabled();
-    let documents = feed::Client::new().fetch_documents(feed_url).await?;
-    let mut candidates = documents
-        .into_iter()
-        .map(|(item, document)| FeedCandidate {
-            run: ItemRun::new("Feed", item.id, item.title),
-            document: Some(document),
-        })
-        .collect::<Vec<_>>();
-
-    for candidate in &mut candidates {
-        candidate.run.pending(color);
-    }
-
-    let mut counts = Vec::new();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        let document = candidate
-            .document
-            .take()
-            .expect("feed documents are prepared once");
-        match document {
-            Ok(document) => match candidate.run.set_document(document) {
-                Ok(()) => counts.push((
-                    index,
-                    candidate
-                        .run
-                        .word_count
-                        .expect("document was just prepared"),
-                )),
-                Err(error) => candidate.run.failed(error, color),
-            },
-            Err(error @ feed::ItemError::Unavailable) => {
-                candidate.run.unavailable(error, color);
-            }
-            Err(error) => candidate.run.failed(error, color),
-        }
-    }
-
-    let admission = admit_in_order(counts, global.max_words);
-    for (index, exhausted) in admission.skipped {
-        candidates[index].run.budget_skipped(exhausted, color);
-    }
-    for index in admission.admitted {
-        candidates[index].run.prepare(color);
-    }
-
-    let mut items = candidates
-        .into_iter()
-        .map(|candidate| candidate.run)
-        .collect::<Vec<_>>();
-    execute(
-        &mut items,
-        global.dry_run,
-        global.pangram_api_key,
-        global.pangram_api_base_url,
-        color,
-    )
-    .await
-}
-
-fn admit_in_order(counts: impl IntoIterator<Item = (usize, usize)>, max_words: usize) -> Admission {
+pub(crate) fn admit_in_order(
+    counts: impl IntoIterator<Item = (usize, usize)>,
+    max_words: usize,
+) -> Admission {
     let mut budget = scoring::WordBudget::new(max_words);
     let mut admission = Admission {
         admitted: Vec::new(),
@@ -318,7 +171,7 @@ fn billable_units(words: usize) -> usize {
     words.div_ceil(PANGRAM_UNIT_WORDS).max(1)
 }
 
-fn partition(items: &mut [ItemRun], color: bool) -> Vec<BulkJob> {
+fn partition(items: &mut [ScoringItem], color: bool) -> Vec<BulkJob> {
     for item in items
         .iter_mut()
         .filter(|item| item.state == ItemState::Prepared)
@@ -361,8 +214,8 @@ fn partition(items: &mut [ItemRun], color: bool) -> Vec<BulkJob> {
     jobs
 }
 
-async fn execute(
-    items: &mut [ItemRun],
+pub(crate) async fn execute_source_items(
+    items: &mut [ScoringItem],
     dry_run: bool,
     pangram_api_key: Option<String>,
     pangram_api_base_url: Option<Url>,
@@ -414,7 +267,7 @@ async fn execute_jobs(
     client: &pangram::Client,
     model: &str,
     jobs: &[BulkJob],
-    items: &mut [ItemRun],
+    items: &mut [ScoringItem],
     color: bool,
 ) -> Result<()> {
     for (job_index, job) in jobs.iter().enumerate() {
@@ -433,7 +286,7 @@ async fn execute_job(
     client: &pangram::Client,
     model: &str,
     job: &BulkJob,
-    items: &mut [ItemRun],
+    items: &mut [ScoringItem],
     color: bool,
 ) -> Result<()> {
     let inputs = job
@@ -561,7 +414,7 @@ async fn execute_job(
 
 fn order_outcomes(
     indices: &[usize],
-    items: &[ItemRun],
+    items: &[ScoringItem],
     outcomes: Vec<pangram::BulkItemOutcome>,
     bulk_id: &str,
 ) -> Result<Vec<(usize, pangram::BulkItemOutcome)>> {
@@ -593,7 +446,7 @@ fn order_outcomes(
     Ok(ordered)
 }
 
-fn finish(items: &[ItemRun]) -> Result<()> {
+fn finish(items: &[ScoringItem]) -> Result<()> {
     let failures = items
         .iter()
         .filter(|item| item.state == ItemState::Failed)
@@ -710,8 +563,8 @@ mod tests {
         ));
     }
 
-    fn prepared_item(id: &str, words: usize) -> ItemRun {
-        ItemRun {
+    fn prepared_item(id: &str, words: usize) -> ScoringItem {
+        ScoringItem {
             source: "Feed",
             id: id.to_owned(),
             title: Some(id.to_owned()),

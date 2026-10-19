@@ -3,7 +3,7 @@
 pub(crate) mod pangram;
 mod workflow;
 
-pub(crate) use workflow::{score_feed, score_matter};
+pub(crate) use workflow::{ScoringItem, admit_in_order, execute_source_items};
 
 use anyhow::{Context, Result};
 use url::Url;
