@@ -27,7 +27,7 @@ enum ItemState {
     Submitted,
     Completed,
     DryRun,
-    PangramPending,
+    TimedOut,
 }
 
 impl fmt::Display for ItemState {
@@ -42,7 +42,7 @@ impl fmt::Display for ItemState {
             Self::Submitted => "Submitted",
             Self::Completed => "Completed",
             Self::DryRun => "Dry run",
-            Self::PangramPending => "Pangram pending",
+            Self::TimedOut => "Pangram timed out",
         })
     }
 }
@@ -415,7 +415,7 @@ async fn execute_job(
                 let detail = format!(
                     "Pangram bulk {bulk_id} task {task_id} remains {status} and can be resumed"
                 );
-                items[index].transition(ItemState::PangramPending, Some(&detail), color);
+                items[index].transition(ItemState::TimedOut, Some(&detail), color);
             }
         }
     }
@@ -474,7 +474,7 @@ fn finish(items: &[ScoringItem]) -> Result<()> {
         .filter(|item| {
             matches!(
                 item.state,
-                ItemState::Completed | ItemState::DryRun | ItemState::PangramPending
+                ItemState::Completed | ItemState::DryRun | ItemState::TimedOut
             )
         })
         .collect::<Vec<_>>();
