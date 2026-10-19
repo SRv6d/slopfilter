@@ -6,7 +6,6 @@ use crate::pangram;
 
 pub(crate) struct Scorer {
     mode: Mode,
-    remaining_words: usize,
 }
 
 enum Mode {
@@ -23,14 +22,20 @@ pub(crate) struct BudgetExhausted {
     pub(crate) remaining_words: usize,
 }
 
-pub(crate) type Admission = std::result::Result<Option<pangram::ScoreOutcome>, BudgetExhausted>;
+// Keep completed scores inline; boxing every live result adds an avoidable allocation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum RealtimeOutcome {
+    DryRun,
+    Pangram(pangram::ScoreOutcome),
+}
+
+pub(crate) struct WordBudget {
+    remaining_words: usize,
+}
 
 impl Scorer {
-    pub(crate) fn new(
-        max_words: usize,
-        dry_run: bool,
-        pangram_api_key: Option<String>,
-    ) -> Result<Self> {
+    pub(crate) fn new(dry_run: bool, pangram_api_key: Option<String>) -> Result<Self> {
         let mode = if dry_run {
             Mode::DryRun
         } else {
@@ -42,25 +47,12 @@ impl Scorer {
             }
         };
 
-        Ok(Self {
-            mode,
-            remaining_words: max_words,
-        })
+        Ok(Self { mode })
     }
 
-    pub(crate) async fn score(&mut self, text: &str, word_count: usize) -> Result<Admission> {
-        if word_count > self.remaining_words {
-            return Ok(Err(BudgetExhausted {
-                document_words: word_count,
-                remaining_words: self.remaining_words,
-            }));
-        }
-
+    pub(crate) async fn score(&mut self, text: &str) -> Result<RealtimeOutcome> {
         match &mut self.mode {
-            Mode::DryRun => {
-                self.remaining_words -= word_count;
-                Ok(Ok(None))
-            }
+            Mode::DryRun => Ok(RealtimeOutcome::DryRun),
             Mode::Live { client, model } => {
                 if model.is_none() {
                     *model = Some(
@@ -71,35 +63,58 @@ impl Scorer {
                     );
                 }
 
-                self.remaining_words -= word_count;
                 let outcome = client
                     .score(
                         text,
                         model.as_deref().expect("the model was just initialized"),
                     )
                     .await?;
-                Ok(Ok(Some(outcome)))
+                Ok(RealtimeOutcome::Pangram(outcome))
             }
         }
     }
 }
 
+impl WordBudget {
+    pub(crate) fn new(max_words: usize) -> Self {
+        Self {
+            remaining_words: max_words,
+        }
+    }
+
+    pub(crate) fn admit(
+        &mut self,
+        document_words: usize,
+    ) -> std::result::Result<(), BudgetExhausted> {
+        if document_words > self.remaining_words {
+            return Err(BudgetExhausted {
+                document_words,
+                remaining_words: self.remaining_words,
+            });
+        }
+
+        self.remaining_words -= document_words;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BudgetExhausted, Scorer};
+    use super::{BudgetExhausted, WordBudget};
 
-    #[tokio::test]
-    async fn cumulative_budget_stops_before_the_first_document_that_does_not_fit() {
-        let mut scorer = Scorer::new(10, true, None).unwrap();
+    #[test]
+    fn cumulative_budget_rejects_only_documents_that_do_not_fit() {
+        let mut budget = WordBudget::new(10);
 
-        assert!(scorer.score("first", 6).await.unwrap().unwrap().is_none());
-        assert!(scorer.score("second", 4).await.unwrap().unwrap().is_none());
+        assert_eq!(budget.admit(6), Ok(()));
         assert_eq!(
-            scorer.score("third", 1).await.unwrap().unwrap_err(),
-            BudgetExhausted {
-                document_words: 1,
-                remaining_words: 0,
-            }
+            budget.admit(5),
+            Err(BudgetExhausted {
+                document_words: 5,
+                remaining_words: 4,
+            })
         );
+        assert_eq!(budget.admit(4), Ok(()));
+        assert_eq!(budget.remaining_words, 0);
     }
 }

@@ -39,6 +39,31 @@ Options:
       --pangram-api-key <KEY>     The Pangram API key [env: PANGRAM_API_KEY]
   -h, --help                      Print help
 ```
+## Processing model
+
+`matter` and `feed` use Pangram's bulk API. Each run has three sequential
+phases:
+
+1. Discover every source item and display it as `Pending`.
+2. Select and prepare documents in source order under `--max-words`.
+3. Partition prepared documents and submit one Pangram bulk job at a time.
+
+For Matter, the list response's estimated `word_count` controls initial
+admission. Markdown is requested only for admitted items, with up to four
+Matter requests in flight. The downloaded Markdown is counted again; an item
+whose actual content no longer fits is skipped without preventing later
+admitted items from being considered. Feed entries use the word count of their
+inline full-text content directly.
+
+`--max-words` limits source words, not Pangram billing. A bulk item consumes at
+least one unit and one additional unit for every started 100-word block. Jobs
+are split at 1,000 units. Results and item-level failures are applied in source
+order even if Pangram returns them in another order.
+
+`--dry-run` performs discovery, selection, Matter Markdown fetching, and bulk
+partitioning without requiring `PANGRAM_API_KEY` or contacting Pangram.
+`file` and `stdin` continue to use Pangram's realtime task API.
+
 
 [Matter]: https://www.getmatter.com
 [Pangram]: https://www.pangram.com

@@ -9,9 +9,10 @@ use std::{
 use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
-use futures_util::{StreamExt, pin_mut};
-use source::{Document, feed, matter};
+use source::{Document, matter};
 use url::Url;
+
+mod bulk_workflow;
 
 pub mod pangram;
 pub mod scoring;
@@ -169,148 +170,11 @@ async fn main() -> Result<()> {
             list_options,
             matter_api_token,
             global,
-        } => score_matter(matter_api_token, list_options, global).await,
-        ScoreInput::Feed { url, global } => score_feed(url, global).await,
+        } => bulk_workflow::score_matter(matter_api_token, list_options, global).await,
+        ScoreInput::Feed { url, global } => bulk_workflow::score_feed(url, global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
     }
-}
-
-/// Scores a source's items in order under one word budget and reports
-/// per-item outcomes the same way for every source.
-struct ItemScoring {
-    source: &'static str,
-    scorer: scoring::Scorer,
-    color: bool,
-    total_words: usize,
-    scored: usize,
-    failures: usize,
-}
-
-impl ItemScoring {
-    fn new(source: &'static str, global: GlobalArgs) -> Result<Self> {
-        Ok(Self {
-            source,
-            scorer: scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?,
-            color: color_enabled(),
-            total_words: 0,
-            scored: 0,
-            failures: 0,
-        })
-    }
-
-    /// Returns `false` once the word budget is exhausted.
-    async fn score(&mut self, item_id: String, document: Document) -> Result<bool> {
-        let document = PreparedDocument::new(InputDocument::Item {
-            source: self.source,
-            item_id,
-            document,
-        })?;
-
-        if !score_prepared_document(&mut self.scorer, &document, self.color).await? {
-            return Ok(false);
-        }
-
-        self.total_words = self
-            .total_words
-            .checked_add(document.word_count)
-            .context("total word count overflowed")?;
-        self.scored += 1;
-        Ok(true)
-    }
-
-    fn unavailable(&self, item_id: &str, title: Option<&str>, reason: impl fmt::Display) {
-        eprintln!(
-            "{}",
-            format_item_issue(
-                "Unavailable",
-                item_id,
-                title,
-                reason,
-                self.source,
-                self.color
-            )
-        );
-    }
-
-    fn failed(&mut self, item_id: &str, title: Option<&str>, error: impl fmt::Display) {
-        self.failures += 1;
-        eprintln!(
-            "{}",
-            format_item_issue("Failed", item_id, title, error, self.source, self.color)
-        );
-    }
-
-    fn finish(self) -> Result<()> {
-        if self.failures > 0 {
-            bail!(
-                "failed to process {} {} item(s)",
-                self.failures,
-                self.source
-            );
-        }
-
-        let noun = if self.scored == 1 {
-            "article"
-        } else {
-            "articles"
-        };
-        println!(
-            "Total: {} words across {} eligible {noun}.",
-            self.total_words, self.scored
-        );
-        Ok(())
-    }
-}
-
-async fn score_matter(
-    matter_api_token: String,
-    list_options: matter::ListOptions,
-    global: GlobalArgs,
-) -> Result<()> {
-    let mut scoring = ItemScoring::new("Matter", global)?;
-    let client = matter::Client::new(matter_api_token);
-    let documents = client.list_documents(list_options);
-    pin_mut!(documents);
-
-    while let Some(listed) = documents.next().await {
-        let (item, document) = listed.context("failed to list Matter items")?;
-
-        match document {
-            Ok(document) => {
-                if !scoring.score(item.id, document).await? {
-                    break;
-                }
-            }
-            Err(matter::ItemError::Unavailable { reason }) => {
-                scoring.unavailable(&item.id, Some(&item.title), reason);
-            }
-            Err(error) => scoring.failed(&item.id, Some(&item.title), error),
-        }
-    }
-
-    scoring.finish()
-}
-
-async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
-    let mut scoring = ItemScoring::new("Feed", global)?;
-    let documents = feed::Client::new().fetch_documents(feed_url).await?;
-
-    for (item, document) in documents {
-        match document {
-            Ok(document) => {
-                if !scoring.score(item.id, document).await? {
-                    break;
-                }
-            }
-            Err(error @ feed::ItemError::Unavailable) => {
-                scoring.unavailable(&item.id, item.title.as_deref(), error);
-            }
-            Err(error) => scoring.failed(&item.id, item.title.as_deref(), error),
-        }
-    }
-
-    scoring.finish()
 }
 
 async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
@@ -350,11 +214,11 @@ async fn score_stdin(global: GlobalArgs) -> Result<()> {
 
 async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> Result<()> {
     let color = color_enabled();
-    let mut scorer =
-        scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
+    let mut budget = scoring::WordBudget::new(global.max_words);
+    let mut scorer = scoring::Scorer::new(global.dry_run, global.pangram_api_key)?;
 
     for document in documents {
-        if !score_prepared_document(&mut scorer, document, color).await? {
+        if !score_prepared_document(&mut scorer, &mut budget, document, color).await? {
             break;
         }
     }
@@ -364,50 +228,50 @@ async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> 
 
 async fn score_prepared_document(
     scorer: &mut scoring::Scorer,
+    budget: &mut scoring::WordBudget,
     document: &PreparedDocument,
     color: bool,
 ) -> Result<bool> {
+    if let Err(scoring::BudgetExhausted {
+        document_words,
+        remaining_words,
+    }) = budget.admit(document.word_count)
+    {
+        println!(
+            "{}",
+            format_document(&document.document, document.word_count, color)
+        );
+        let word_noun = if remaining_words == 1 {
+            "word"
+        } else {
+            "words"
+        };
+        println!(
+            "  Pangram: word budget exhausted; {remaining_words} {word_noun} remaining, \
+             but this document has {document_words}"
+        );
+        return Ok(false);
+    }
+
     let outcome = scorer
-        .score(&document.document.document().text, document.word_count)
+        .score(&document.document.document().text)
         .await
         .with_context(|| format!("failed to score {}", document.document))?;
-
     match outcome {
-        Err(scoring::BudgetExhausted {
-            document_words,
-            remaining_words,
-        }) => {
-            println!(
-                "{}",
-                format_document(&document.document, document.word_count, color)
-            );
-            let word_noun = if remaining_words == 1 {
-                "word"
-            } else {
-                "words"
-            };
-            println!(
-                "  Pangram: word budget exhausted; {remaining_words} {word_noun} remaining, \
-                 but this document has {document_words}"
-            );
-            Ok(false)
-        }
-        Ok(None) => {
+        scoring::RealtimeOutcome::DryRun => {
             println!(
                 "{}",
                 format_document(&document.document, document.word_count, color)
             );
             println!("  Pangram: dry run; would submit");
-            Ok(true)
         }
-        Ok(Some(pangram::ScoreOutcome::Complete(score))) => {
+        scoring::RealtimeOutcome::Pangram(pangram::ScoreOutcome::Complete(score)) => {
             println!(
                 "{}",
                 format_scored_document(&document.document, document.word_count, &score, color)
             );
-            Ok(true)
         }
-        Ok(Some(pangram::ScoreOutcome::Pending { task, stage })) => {
+        scoring::RealtimeOutcome::Pangram(pangram::ScoreOutcome::Pending { task, stage }) => {
             println!(
                 "{}",
                 format_document(&document.document, document.word_count, color)
@@ -416,9 +280,9 @@ async fn score_prepared_document(
                 "  Pangram task {} ({}) remains {stage} and can be resumed.",
                 task.task_id, task.model
             );
-            Ok(true)
         }
     }
+    Ok(true)
 }
 
 fn color_enabled() -> bool {
@@ -478,20 +342,6 @@ fn format_scored_document(
     )
     .expect("writing to a String cannot fail");
     output
-}
-
-fn format_item_issue(
-    kind: &str,
-    item_id: &str,
-    title: Option<&str>,
-    detail: impl fmt::Display,
-    source: &str,
-    color: bool,
-) -> String {
-    format!(
-        "{kind}: {}\n  {detail} · {source}: {item_id}",
-        render_title(display_title(title), color),
-    )
 }
 
 fn display_title(title: Option<&str>) -> &str {
