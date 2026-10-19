@@ -1,8 +1,12 @@
-//! Source-independent Pangram scoring policy.
+//! Scoring policy, workflows, and provider implementations.
+
+pub(crate) mod pangram;
+mod workflow;
+
+pub(crate) use workflow::{score_feed, score_matter};
 
 use anyhow::{Context, Result};
-
-use crate::pangram;
+use url::Url;
 
 pub(crate) struct Scorer {
     mode: Mode,
@@ -35,14 +39,18 @@ pub(crate) struct WordBudget {
 }
 
 impl Scorer {
-    pub(crate) fn new(dry_run: bool, pangram_api_key: Option<String>) -> Result<Self> {
+    pub(crate) fn new(
+        dry_run: bool,
+        pangram_api_key: Option<String>,
+        pangram_api_base_url: Option<Url>,
+    ) -> Result<Self> {
         let mode = if dry_run {
             Mode::DryRun
         } else {
             let api_key =
                 pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
             Mode::Live {
-                client: pangram::Client::new(api_key),
+                client: pangram::Client::new(api_key, pangram_api_base_url),
                 model: None,
             }
         };

@@ -9,8 +9,9 @@ use url::Url;
 
 use crate::{
     GlobalArgs, InputDocument, PreparedDocument, color_enabled, display_title, format_document,
-    format_scored_document, pangram, render_title, scoring, source::Document, source::feed,
-    source::matter,
+    format_scored_document, render_title,
+    scoring::{self, pangram},
+    source::{Document, feed, matter},
 };
 
 const PANGRAM_UNIT_WORDS: usize = 100;
@@ -226,7 +227,14 @@ pub(crate) async fn score_matter(
         .into_iter()
         .map(|candidate| candidate.run)
         .collect::<Vec<_>>();
-    execute(&mut items, global.dry_run, global.pangram_api_key, color).await
+    execute(
+        &mut items,
+        global.dry_run,
+        global.pangram_api_key,
+        global.pangram_api_base_url,
+        color,
+    )
+    .await
 }
 
 pub(crate) async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
@@ -280,7 +288,14 @@ pub(crate) async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> 
         .into_iter()
         .map(|candidate| candidate.run)
         .collect::<Vec<_>>();
-    execute(&mut items, global.dry_run, global.pangram_api_key, color).await
+    execute(
+        &mut items,
+        global.dry_run,
+        global.pangram_api_key,
+        global.pangram_api_base_url,
+        color,
+    )
+    .await
 }
 
 fn admit_in_order(counts: impl IntoIterator<Item = (usize, usize)>, max_words: usize) -> Admission {
@@ -350,6 +365,7 @@ async fn execute(
     items: &mut [ItemRun],
     dry_run: bool,
     pangram_api_key: Option<String>,
+    pangram_api_base_url: Option<Url>,
     color: bool,
 ) -> Result<()> {
     let jobs = partition(items, color);
@@ -383,7 +399,7 @@ async fn execute(
     if !jobs.is_empty() {
         let api_key =
             pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
-        let client = pangram::Client::new(api_key);
+        let client = pangram::Client::new(api_key, pangram_api_base_url);
         let model = client
             .discover_model()
             .await
@@ -615,7 +631,6 @@ fn finish(items: &[ItemRun]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pangram::test_support::{Response, ScriptedServer, assert_api_key, assert_request};
 
     #[test]
     fn matter_admission_uses_estimates_then_rechecks_actual_counts() {
@@ -693,135 +708,6 @@ mod tests {
             &ordered[2].1,
             pangram::BulkItemOutcome::Failed { message, .. } if message == "third failed"
         ));
-    }
-
-    #[tokio::test]
-    async fn sequential_jobs_submit_poll_and_apply_item_results() {
-        let server = ScriptedServer::start(sequential_bulk_responses()).await;
-        let client = pangram::Client::with_base_url("secret-key".to_owned(), server.base_url());
-        let mut items = vec![prepared_item("first", 100_000), prepared_item("second", 1)];
-        let jobs = partition(&mut items, false);
-
-        execute_jobs(&client, "pangram-4", &jobs, &mut items, false)
-            .await
-            .unwrap();
-        let requests = server.finish().await;
-
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(items[0].state, ItemState::Completed);
-        assert_eq!(items[1].state, ItemState::Failed);
-        assert_api_key(&requests, "secret-key");
-        assert_request(&requests[0], "POST", "/bulk");
-        assert_request(&requests[1], "GET", "/bulk/bulk-first");
-        assert_request(&requests[2], "GET", "/bulk/bulk-first/results");
-        assert_request(&requests[3], "POST", "/bulk");
-        assert_request(&requests[4], "GET", "/bulk/bulk-second");
-        assert_request(&requests[5], "GET", "/bulk/bulk-second/results");
-        let first: serde_json::Value = requests[0].body_json().unwrap();
-        let second: serde_json::Value = requests[3].body_json().unwrap();
-        assert_eq!(first["items"][0]["id"], "first");
-        assert_eq!(second["items"][0]["id"], "second");
-    }
-
-    fn sequential_bulk_responses() -> [Response; 6] {
-        [
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-first",
-                    "status":"queued",
-                    "total_items":1,
-                    "accepted_items":[
-                        {"index":0,"id":"first","task_id":"task-first"}
-                    ],
-                    "failed_items":[]
-                }"#,
-            ),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-first",
-                    "status":"succeeded",
-                    "total_items":1,
-                    "accepted":1,
-                    "succeeded":1,
-                    "failed":0
-                }"#,
-            ),
-            Response::ok(format!(
-                r#"{{
-                    "bulk_id":"bulk-first",
-                    "offset":0,
-                    "limit":1000,
-                    "total_items":1,
-                    "items":[{{
-                        "index":0,
-                        "id":"first",
-                        "task_id":"task-first",
-                        "stage":"STAGE_SUCCESS",
-                        "error":null,
-                        "result":{}
-                    }}],
-                    "failed_items":[]
-                }}"#,
-                score_response("first")
-            )),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-second",
-                    "status":"queued",
-                    "total_items":1,
-                    "accepted_items":[
-                        {"index":0,"id":"second","task_id":"task-second"}
-                    ],
-                    "failed_items":[]
-                }"#,
-            ),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-second",
-                    "status":"failed",
-                    "total_items":1,
-                    "accepted":1,
-                    "succeeded":0,
-                    "failed":1
-                }"#,
-            ),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-second",
-                    "offset":0,
-                    "limit":1000,
-                    "total_items":1,
-                    "items":[],
-                    "failed_items":[{
-                        "index":0,
-                        "id":"second",
-                        "task_id":"task-second",
-                        "stage":"STAGE_FAILED",
-                        "error":"invalid text"
-                    }]
-                }"#,
-            ),
-        ]
-    }
-
-    fn score_response(text: &str) -> String {
-        format!(
-            r#"{{
-                "stage":"STAGE_SUCCESS",
-                "text":"{text}",
-                "version":"4.0",
-                "headline":"Human Written",
-                "prediction":"This text appears human-written.",
-                "prediction_short":"Human",
-                "fraction_ai":0.0,
-                "fraction_ai_assisted":0.0,
-                "fraction_human":1.0,
-                "num_ai_segments":0,
-                "num_ai_assisted_segments":0,
-                "num_human_segments":1,
-                "windows":[]
-            }}"#
-        )
     }
 
     fn prepared_item(id: &str, words: usize) -> ItemRun {

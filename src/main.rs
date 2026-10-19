@@ -12,9 +12,6 @@ use clap::{Args, Parser, Subcommand, ValueHint};
 use source::{Document, matter};
 use url::Url;
 
-mod bulk_workflow;
-
-pub mod pangram;
 pub mod scoring;
 pub mod source;
 pub mod store;
@@ -54,6 +51,16 @@ struct GlobalArgs {
         required_unless_present = "dry_run"
     )]
     pangram_api_key: Option<String>,
+
+    /// Override the Pangram API endpoint.
+    #[arg(
+        long,
+        env = "SLOPFILTER_PANGRAM_API_BASE_URL",
+        hide = true,
+        value_name = "URL",
+        value_parser = parse_pangram_api_base_url
+    )]
+    pangram_api_base_url: Option<Url>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,8 +177,8 @@ async fn main() -> Result<()> {
             list_options,
             matter_api_token,
             global,
-        } => bulk_workflow::score_matter(matter_api_token, list_options, global).await,
-        ScoreInput::Feed { url, global } => bulk_workflow::score_feed(url, global).await,
+        } => scoring::score_matter(matter_api_token, list_options, global).await,
+        ScoreInput::Feed { url, global } => scoring::score_feed(url, global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
     }
@@ -215,7 +222,11 @@ async fn score_stdin(global: GlobalArgs) -> Result<()> {
 async fn score_documents(documents: &[PreparedDocument], global: GlobalArgs) -> Result<()> {
     let color = color_enabled();
     let mut budget = scoring::WordBudget::new(global.max_words);
-    let mut scorer = scoring::Scorer::new(global.dry_run, global.pangram_api_key)?;
+    let mut scorer = scoring::Scorer::new(
+        global.dry_run,
+        global.pangram_api_key,
+        global.pangram_api_base_url,
+    )?;
 
     for document in documents {
         if !score_prepared_document(&mut scorer, &mut budget, document, color).await? {
@@ -265,13 +276,16 @@ async fn score_prepared_document(
             );
             println!("  Pangram: dry run; would submit");
         }
-        scoring::RealtimeOutcome::Pangram(pangram::ScoreOutcome::Complete(score)) => {
+        scoring::RealtimeOutcome::Pangram(scoring::pangram::ScoreOutcome::Complete(score)) => {
             println!(
                 "{}",
                 format_scored_document(&document.document, document.word_count, &score, color)
             );
         }
-        scoring::RealtimeOutcome::Pangram(pangram::ScoreOutcome::Pending { task, stage }) => {
+        scoring::RealtimeOutcome::Pangram(scoring::pangram::ScoreOutcome::Pending {
+            task,
+            stage,
+        }) => {
             println!(
                 "{}",
                 format_document(&document.document, document.word_count, color)
@@ -326,7 +340,7 @@ fn format_document(document: &InputDocument, word_count: usize, color: bool) -> 
 fn format_scored_document(
     document: &InputDocument,
     word_count: usize,
-    score: &pangram::Score,
+    score: &scoring::pangram::Score,
     color: bool,
 ) -> String {
     let mut output = format_document(document, word_count, color);
@@ -371,10 +385,32 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
     }
 }
 
+fn parse_pangram_api_base_url(value: &str) -> std::result::Result<Url, String> {
+    let mut url = Url::parse(value).map_err(|error| format!("invalid Pangram API URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Pangram API URL must use HTTP or HTTPS".to_owned());
+    }
+    if url.cannot_be_a_base() {
+        return Err("Pangram API URL must be an absolute base URL".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Pangram API URL must not contain credentials".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Pangram API URL must not contain a query or fragment".to_owned());
+    }
+    if !url.path().ends_with('/') {
+        url.path_segments_mut()
+            .map_err(|_| "Pangram API URL must support path segments".to_owned())?
+            .push("");
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ScoreInput, matter};
-    use clap::Parser;
+    use super::{Cli, ScoreInput, matter, parse_pangram_api_base_url};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn matter_options_follow_the_source() {
@@ -461,5 +497,31 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn pangram_api_base_url_is_hidden_and_normalized() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("pangram-api-base-url"));
+        assert!(!help.contains("SLOPFILTER_PANGRAM_API_BASE_URL"));
+
+        let cli = Cli::try_parse_from([
+            "slopfilter",
+            "file",
+            "article.md",
+            "--dry-run",
+            "--pangram-api-base-url",
+            "http://127.0.0.1:1234/api",
+        ])
+        .unwrap();
+        let ScoreInput::File { global, .. } = cli.input else {
+            panic!("expected file input");
+        };
+        assert_eq!(
+            global.pangram_api_base_url.unwrap().as_str(),
+            "http://127.0.0.1:1234/api/"
+        );
+
+        assert!(parse_pangram_api_base_url("file:///tmp/pangram").is_err());
     }
 }

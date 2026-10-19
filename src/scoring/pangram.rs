@@ -1,7 +1,5 @@
 //! Stateless client for Pangram's asynchronous text-detection API.
 mod bulk;
-#[cfg(test)]
-pub(crate) mod test_support;
 
 pub(crate) use bulk::{BulkInput, BulkItemOutcome};
 
@@ -176,18 +174,12 @@ struct TaskResponse {
 }
 
 impl Client {
-    pub(crate) fn new(api_key: String) -> Self {
-        Self::with_base_url(
-            api_key,
-            Url::parse(API_BASE_URL).expect("the Pangram API URL is valid"),
-        )
-    }
-
-    pub(crate) fn with_base_url(api_key: String, base_url: Url) -> Self {
+    pub(crate) fn new(api_key: String, base_url: Option<Url>) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url,
+            base_url: base_url
+                .unwrap_or_else(|| Url::parse(API_BASE_URL).expect("the Pangram API URL is valid")),
         }
     }
 
@@ -435,88 +427,13 @@ fn validate_pending_task_id(
 mod tests {
     use std::ops::ControlFlow;
 
-    use super::{
-        Client, Error, ScoreOutcome, TaskHandle, TaskResponse, TaskStage,
-        test_support::{Response, ScriptedServer, assert_api_key, assert_request},
-    };
+    use super::{Error, TaskHandle, TaskResponse, TaskStage};
 
     fn task() -> TaskHandle {
         TaskHandle {
             task_id: "task-123".to_owned(),
             model: "pangram-4".to_owned(),
         }
-    }
-
-    #[tokio::test]
-    async fn client_discovers_submits_and_polls_to_success() {
-        let server = ScriptedServer::start([
-            Response::ok(r#"{"models":["pangram-4"]}"#),
-            Response::ok(r#"{"task_id":"task-123"}"#),
-            Response::ok(r#"{"task_id":"task-123","stage":"STAGE_PREPROCESSING"}"#),
-            Response::ok(
-                r##"{
-                    "stage":"STAGE_SUCCESS",
-                    "text":"# An article",
-                    "version":"4.0",
-                    "headline":"Human Written",
-                    "prediction":"This text appears human-written.",
-                    "prediction_short":"Human",
-                    "fraction_ai":0.0,
-                    "fraction_ai_assisted":0.0,
-                    "fraction_human":1.0,
-                    "num_ai_segments":0,
-                    "num_ai_assisted_segments":0,
-                    "num_human_segments":1,
-                    "windows":[]
-                }"##,
-            ),
-        ])
-        .await;
-        let client = Client::with_base_url("secret-key".to_owned(), server.base_url());
-
-        let model = client.discover_model().await.unwrap();
-        let outcome = client.score("# An article", &model).await.unwrap();
-        let requests = server.finish().await;
-
-        assert_api_key(&requests, "secret-key");
-        assert_request(&requests[0], "GET", "/models");
-        assert_request(&requests[1], "POST", "/task");
-        assert_request(&requests[2], "GET", "/task/task-123");
-        assert_request(&requests[3], "GET", "/task/task-123");
-        let body: serde_json::Value = requests[1].body_json().unwrap();
-        assert_eq!(body["text"], "# An article");
-        assert_eq!(body["model"], "pangram-4");
-        assert_eq!(body["public_dashboard_link"], false);
-
-        let ScoreOutcome::Complete(score) = outcome else {
-            panic!("expected a completed score");
-        };
-        assert_eq!(model, "pangram-4");
-        assert_eq!(score.task_id, "task-123");
-        assert_eq!(score.model, "pangram-4");
-        assert_eq!(score.version, "4.0");
-        assert_eq!(score.prediction.short, "Human");
-    }
-
-    #[tokio::test]
-    async fn rejected_submission_includes_status_and_response_body() {
-        let server = ScriptedServer::start([
-            Response::ok(r#"{"models":["pangram-4"]}"#),
-            Response::json(422, r#"{"detail":"requested model is not enabled"}"#),
-        ])
-        .await;
-        let client = Client::with_base_url("secret-key".to_owned(), server.base_url());
-
-        let model = client.discover_model().await.unwrap();
-        let error = client.score("# An article", &model).await.unwrap_err();
-        let requests = server.finish().await;
-        let message = error.to_string();
-
-        assert_api_key(&requests, "secret-key");
-        assert_request(&requests[0], "GET", "/models");
-        assert_request(&requests[1], "POST", "/task");
-        assert!(message.contains("HTTP 422"));
-        assert!(message.contains("requested model is not enabled"));
     }
 
     #[test]

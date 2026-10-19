@@ -492,141 +492,105 @@ fn required_string(value: Option<String>, context: &str, field: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{BulkInput, BulkItemOutcome};
-    use crate::pangram::{
-        Client,
-        test_support::{Response, ScriptedServer, assert_api_key, assert_request},
-    };
+    use super::*;
 
-    #[tokio::test]
-    async fn client_submits_polls_and_returns_individual_results() {
-        let server = ScriptedServer::start([
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"queued",
-                    "total_items":2,
-                    "accepted_items":[
-                        {"index":0,"id":"item-first","task_id":"task-first"},
-                        {"index":1,"id":"item-second","task_id":"task-second"}
-                    ],
-                    "failed_items":[]
-                }"#,
-            ),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"running",
-                    "total_items":2,
-                    "accepted":2,
-                    "succeeded":0,
-                    "failed":0
-                }"#,
-            ),
-            Response::ok(
-                r#"{
-                    "bulk_id":"bulk-123",
-                    "status":"partial",
-                    "total_items":2,
-                    "accepted":2,
-                    "succeeded":1,
-                    "failed":1
-                }"#,
-            ),
-            Response::ok(format!(
-                r#"{{
-                    "bulk_id":"bulk-123",
-                    "offset":0,
-                    "limit":1000,
-                    "total_items":2,
-                    "items":[{{
-                        "index":0,
-                        "id":"item-first",
-                        "task_id":"task-first",
-                        "stage":"STAGE_SUCCESS",
-                        "error":null,
-                        "result":{}
-                    }}],
-                    "failed_items":[{{
-                        "index":1,
-                        "id":"item-second",
-                        "task_id":"task-second",
-                        "stage":"STAGE_FAILED",
-                        "error":"invalid text"
-                    }}]
-                }}"#,
-                score_response("First article")
-            )),
-        ])
-        .await;
-        let client = Client::with_base_url("secret-key".to_owned(), server.base_url());
-        let inputs = [
+    #[test]
+    fn request_serialization_matches_the_bulk_contract() {
+        let items = [
             BulkInput {
-                id: "item-first",
+                id: "first",
                 text: "First article",
             },
             BulkInput {
-                id: "item-second",
+                id: "second",
                 text: "Second article",
             },
         ];
 
-        let submission = client.submit_bulk(&inputs, "pangram-4").await.unwrap();
-        assert!(submission.failed.is_empty());
-        let outcomes = client.wait_for_bulk(&submission.handle).await.unwrap();
-        let requests = server.finish().await;
+        let request = serde_json::to_value(SubmitBulkRequest {
+            items: &items,
+            model: "pangram-4",
+        })
+        .unwrap();
 
-        assert_api_key(&requests, "secret-key");
-        assert_request(&requests[0], "POST", "/bulk");
-        assert_request(&requests[1], "GET", "/bulk/bulk-123");
-        assert_request(&requests[2], "GET", "/bulk/bulk-123");
-        assert_request(&requests[3], "GET", "/bulk/bulk-123/results");
-        let body: serde_json::Value = requests[0].body_json().unwrap();
-        assert_eq!(body["model"], "pangram-4");
-        assert_eq!(body["items"][0]["id"], "item-first");
-        assert_eq!(body["items"][1]["text"], "Second article");
-        assert!(
-            requests[3]
-                .url
-                .query_pairs()
-                .any(|(key, value)| key == "offset" && value == "0")
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "items": [
+                    {"id": "first", "text": "First article"},
+                    {"id": "second", "text": "Second article"}
+                ],
+                "model": "pangram-4"
+            })
         );
-        assert!(
-            requests[3]
-                .url
-                .query_pairs()
-                .any(|(key, value)| key == "limit" && value == "1000")
-        );
-
-        assert!(outcomes.iter().any(|outcome| matches!(
-            outcome,
-            BulkItemOutcome::Failed { id, message }
-                if id == "item-second" && message == "invalid text"
-        )));
-        assert!(outcomes.iter().any(|outcome| matches!(
-            outcome,
-            BulkItemOutcome::Complete { id, score }
-                if id == "item-first" && score.task_id == "task-first"
-        )));
     }
 
-    fn score_response(text: &str) -> String {
-        format!(
-            r#"{{
-                "stage":"STAGE_SUCCESS",
-                "text":"{text}",
-                "version":"4.0",
-                "headline":"Human Written",
-                "prediction":"This text appears human-written.",
-                "prediction_short":"Human",
-                "fraction_ai":0.0,
-                "fraction_ai_assisted":0.0,
-                "fraction_human":1.0,
-                "num_ai_segments":0,
-                "num_ai_assisted_segments":0,
-                "num_human_segments":1,
-                "windows":[]
-            }}"#
+    #[test]
+    fn mixed_result_response_maps_each_item_outcome() {
+        let handle = BulkHandle {
+            bulk_id: "bulk-123".to_owned(),
+            model: "pangram-4".to_owned(),
+            accepted: vec![
+                BulkAccepted {
+                    id: "first".to_owned(),
+                    task_id: "task-first".to_owned(),
+                },
+                BulkAccepted {
+                    id: "second".to_owned(),
+                    task_id: "task-second".to_owned(),
+                },
+            ],
+            total_items: 2,
+            rejected_ids: Vec::new(),
+        };
+        let response: BulkResultsResponse = serde_json::from_str(
+            r#"{
+                "bulk_id":"bulk-123",
+                "total_items":2,
+                "items":[{
+                    "index":0,
+                    "id":"first",
+                    "task_id":"task-first",
+                    "stage":"STAGE_SUCCESS",
+                    "error":null,
+                    "result":{
+                        "stage":"STAGE_SUCCESS",
+                        "text":"First article",
+                        "version":"4.0",
+                        "headline":"Human Written",
+                        "prediction":"This text appears human-written.",
+                        "prediction_short":"Human",
+                        "fraction_ai":0.0,
+                        "fraction_ai_assisted":0.0,
+                        "fraction_human":1.0,
+                        "num_ai_segments":0,
+                        "num_ai_assisted_segments":0,
+                        "num_human_segments":1,
+                        "windows":[]
+                    }
+                }],
+                "failed_items":[{
+                    "index":1,
+                    "id":"second",
+                    "task_id":"task-second",
+                    "stage":"STAGE_FAILED",
+                    "error":"invalid text"
+                }]
+            }"#,
         )
+        .unwrap();
+
+        let outcomes = response.into_outcomes(&handle).unwrap();
+
+        assert!(matches!(
+            &outcomes[0],
+            BulkItemOutcome::Complete { id, score }
+                if id == "first" && score.task_id == "task-first"
+        ));
+        assert!(matches!(
+            &outcomes[1],
+            BulkItemOutcome::Failed { id, message }
+                if id == "second" && message == "invalid text"
+        ));
     }
 }
