@@ -148,6 +148,12 @@ struct BulkJob {
     units: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobDisposition {
+    Complete,
+    Stop,
+}
+
 pub(crate) fn admit_in_order(
     counts: impl IntoIterator<Item = (usize, usize)>,
     max_words: usize,
@@ -277,7 +283,9 @@ async fn execute_jobs(
             job.indices.len(),
             job.units
         );
-        execute_job(client, model, job, items, color).await?;
+        if execute_job(client, model, job, items, color).await? == JobDisposition::Stop {
+            break;
+        }
     }
     Ok(())
 }
@@ -288,7 +296,7 @@ async fn execute_job(
     job: &BulkJob,
     items: &mut [ScoringItem],
     color: bool,
-) -> Result<()> {
+) -> Result<JobDisposition> {
     let inputs = job
         .indices
         .iter()
@@ -312,7 +320,7 @@ async fn execute_job(
             for &index in &job.indices {
                 items[index].failed(&error, color);
             }
-            return Ok(());
+            return Ok(JobDisposition::Stop);
         }
     };
     let bulk_id = submission.handle.bulk_id.clone();
@@ -379,10 +387,11 @@ async fn execute_job(
                     color,
                 );
             }
-            return Ok(());
+            return Ok(JobDisposition::Stop);
         }
     };
     let ordered = order_outcomes(&accepted_indices, items, outcomes, &bulk_id)?;
+    let mut pending = false;
     for (index, outcome) in ordered {
         match outcome {
             pangram::BulkItemOutcome::Complete { score, .. } => {
@@ -402,6 +411,7 @@ async fn execute_job(
             pangram::BulkItemOutcome::Pending {
                 task_id, status, ..
             } => {
+                pending = true;
                 let detail = format!(
                     "Pangram bulk {bulk_id} task {task_id} remains {status} and can be resumed"
                 );
@@ -409,7 +419,11 @@ async fn execute_job(
             }
         }
     }
-    Ok(())
+    Ok(if pending {
+        JobDisposition::Stop
+    } else {
+        JobDisposition::Complete
+    })
 }
 
 fn order_outcomes(

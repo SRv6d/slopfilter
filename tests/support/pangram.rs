@@ -13,8 +13,12 @@ pub(crate) struct Response {
 
 impl Response {
     pub(crate) fn ok(body: impl Into<String>) -> Self {
+        Self::json(200, body)
+    }
+
+    pub(crate) fn json(status: u16, body: impl Into<String>) -> Self {
         Self {
-            status: 200,
+            status,
             body: body.into(),
         }
     }

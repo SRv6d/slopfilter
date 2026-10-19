@@ -130,6 +130,51 @@ async fn feed_runs_sequential_bulk_jobs_and_maps_item_results_in_source_order() 
     assert_eq!(second_job["items"][0]["id"], "item-fourth");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_bulk_submission_does_not_start_the_next_job() {
+    let feed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/atom+xml")
+                .set_body_string(feed_document()),
+        )
+        .expect(1)
+        .mount(&feed)
+        .await;
+
+    let pangram = ScriptedServer::start([
+        Response::ok(r#"{"models":["pangram-4"]}"#),
+        Response::json(500, r#"{"detail":"submission outcome is unknown"}"#),
+    ])
+    .await;
+    let feed_url = format!("{}/feed.xml", feed.uri());
+    let output = Command::new(env!("CARGO_BIN_EXE_slopfilter"))
+        .args([
+            "feed",
+            &feed_url,
+            "--max-words",
+            "100001",
+            "--pangram-api-key",
+            API_KEY,
+        ])
+        .env(
+            "SLOPFILTER_PANGRAM_API_BASE_URL",
+            pangram.base_url().as_str(),
+        )
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("slopfilter runs");
+    let requests = pangram.finish().await;
+
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_request(&requests[0], "GET", "/models");
+    assert_request(&requests[1], "POST", "/bulk");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Bulk job 2:"), "{}", output_text(&output));
+}
+
 fn run_with_stdin(args: &[&str], input: &str, pangram: &ScriptedServer) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_slopfilter"))
         .args(args)
