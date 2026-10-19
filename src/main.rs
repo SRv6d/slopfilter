@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    fmt::{self, Write as _},
+    fs,
     io::{self, IsTerminal, Read},
     path::PathBuf,
 };
@@ -8,14 +10,14 @@ use anstyle::Style;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use futures_util::{StreamExt, pin_mut};
-use source::{Document, matter};
+use source::{Document, feed, matter};
+use url::Url;
 
 pub mod pangram;
 pub mod scoring;
 pub mod source;
 pub mod store;
 
-const MAX_BUFFERED_MATTER_ITEMS: usize = 4;
 const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 /// Inspect and score text for likely AI authorship.
@@ -74,6 +76,16 @@ enum ScoreInput {
         global: GlobalArgs,
     },
 
+    /// Score entries of an Atom or RSS feed.
+    Feed {
+        /// The Atom or RSS feed URL.
+        #[arg(value_name = "URL", value_hint = ValueHint::Url)]
+        url: Url,
+
+        #[command(flatten)]
+        global: GlobalArgs,
+    },
+
     /// Score a UTF-8 text or Markdown file.
     File {
         /// The UTF-8 text or Markdown file to score.
@@ -92,25 +104,37 @@ enum ScoreInput {
 }
 
 enum InputDocument {
-    Matter { item_id: String, document: Document },
-    File { path: PathBuf, document: Document },
-    Stdin { document: Document },
+    /// An item listed by a source such as Matter or a feed.
+    Item {
+        source: &'static str,
+        item_id: String,
+        document: Document,
+    },
+    File {
+        path: PathBuf,
+        document: Document,
+    },
+    Stdin {
+        document: Document,
+    },
 }
 
 impl InputDocument {
     fn document(&self) -> &Document {
         match self {
-            Self::Matter { document, .. }
+            Self::Item { document, .. }
             | Self::File { document, .. }
             | Self::Stdin { document } => document,
         }
     }
 }
 
-impl std::fmt::Display for InputDocument {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for InputDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Matter { item_id, .. } => write!(formatter, "Matter item {item_id}"),
+            Self::Item {
+                source, item_id, ..
+            } => write!(formatter, "{source} item {item_id}"),
             Self::File { path, .. } => write!(formatter, "file {}", path.display()),
             Self::Stdin { .. } => formatter.write_str("standard input"),
         }
@@ -146,8 +170,96 @@ async fn main() -> Result<()> {
             matter_api_token,
             global,
         } => score_matter(matter_api_token, list_options, global).await,
+        ScoreInput::Feed { url, global } => score_feed(url, global).await,
         ScoreInput::File { path, global } => score_file(path, global).await,
         ScoreInput::Stdin { global } => score_stdin(global).await,
+    }
+}
+
+/// Scores a source's items in order under one word budget and reports
+/// per-item outcomes the same way for every source.
+struct ItemScoring {
+    source: &'static str,
+    scorer: scoring::Scorer,
+    color: bool,
+    total_words: usize,
+    scored: usize,
+    failures: usize,
+}
+
+impl ItemScoring {
+    fn new(source: &'static str, global: GlobalArgs) -> Result<Self> {
+        Ok(Self {
+            source,
+            scorer: scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?,
+            color: color_enabled(),
+            total_words: 0,
+            scored: 0,
+            failures: 0,
+        })
+    }
+
+    /// Returns `false` once the word budget is exhausted.
+    async fn score(&mut self, item_id: String, document: Document) -> Result<bool> {
+        let document = PreparedDocument::new(InputDocument::Item {
+            source: self.source,
+            item_id,
+            document,
+        })?;
+
+        if !score_prepared_document(&mut self.scorer, &document, self.color).await? {
+            return Ok(false);
+        }
+
+        self.total_words = self
+            .total_words
+            .checked_add(document.word_count)
+            .context("total word count overflowed")?;
+        self.scored += 1;
+        Ok(true)
+    }
+
+    fn unavailable(&self, item_id: &str, title: Option<&str>, reason: impl fmt::Display) {
+        eprintln!(
+            "{}",
+            format_item_issue(
+                "Unavailable",
+                item_id,
+                title,
+                reason,
+                self.source,
+                self.color
+            )
+        );
+    }
+
+    fn failed(&mut self, item_id: &str, title: Option<&str>, error: impl fmt::Display) {
+        self.failures += 1;
+        eprintln!(
+            "{}",
+            format_item_issue("Failed", item_id, title, error, self.source, self.color)
+        );
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.failures > 0 {
+            bail!(
+                "failed to process {} {} item(s)",
+                self.failures,
+                self.source
+            );
+        }
+
+        let noun = if self.scored == 1 {
+            "article"
+        } else {
+            "articles"
+        };
+        println!(
+            "Total: {} words across {} eligible {noun}.",
+            self.total_words, self.scored
+        );
+        Ok(())
     }
 }
 
@@ -156,107 +268,49 @@ async fn score_matter(
     list_options: matter::ListOptions,
     global: GlobalArgs,
 ) -> Result<()> {
-    let color = color_enabled();
-    let mut scorer =
-        scoring::Scorer::new(global.max_words, global.dry_run, global.pangram_api_key)?;
+    let mut scoring = ItemScoring::new("Matter", global)?;
     let client = matter::Client::new(matter_api_token);
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<
-        std::result::Result<
-            (matter::Item, std::result::Result<(), matter::ItemError>),
-            matter::Error,
-        >,
-    >(MAX_BUFFERED_MATTER_ITEMS);
-    let producer = tokio::spawn(async move {
-        let items = client.list_items_with_markdown(list_options);
-        pin_mut!(items);
+    let documents = client.list_documents(list_options);
+    pin_mut!(documents);
 
-        while let Some(item) = items.next().await {
-            if sender.send(item).await.is_err() {
-                break;
-            }
-        }
-    });
+    while let Some(listed) = documents.next().await {
+        let (item, document) = listed.context("failed to list Matter items")?;
 
-    let mut total_words = 0usize;
-    let mut available = 0usize;
-    let mut failures = 0usize;
-    let mut list_error = None;
-
-    let processing = async {
-        while let Some(listed) = receiver.recv().await {
-            let (item, outcome) = match listed {
-                Ok(listed) => listed,
-                Err(error) => {
-                    list_error = Some(error);
+        match document {
+            Ok(document) => {
+                if !scoring.score(item.id, document).await? {
                     break;
                 }
-            };
+            }
+            Err(matter::ItemError::Unavailable { reason }) => {
+                scoring.unavailable(&item.id, Some(&item.title), reason);
+            }
+            Err(error) => scoring.failed(&item.id, Some(&item.title), error),
+        }
+    }
 
-            match outcome {
-                Ok(()) => {
-                    let (item_id, document) = match item.into_document() {
-                        Ok(document) => document,
-                        Err(error) => {
-                            failures += 1;
-                            eprintln!("Failed: {error}");
-                            continue;
-                        }
-                    };
-                    let document =
-                        PreparedDocument::new(InputDocument::Matter { item_id, document })?;
+    scoring.finish()
+}
 
-                    if !score_prepared_document(&mut scorer, &document, color).await? {
-                        break;
-                    }
+async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
+    let mut scoring = ItemScoring::new("Feed", global)?;
+    let documents = feed::Client::new().fetch_documents(feed_url).await?;
 
-                    total_words = total_words
-                        .checked_add(document.word_count)
-                        .context("total word count overflowed")?;
-                    available += 1;
-                }
-                Err(matter::ItemError::Unavailable { reason }) => {
-                    eprintln!("{}", format_unavailable(&item, &reason, color));
-                }
-                Err(error) => {
-                    failures += 1;
-                    eprintln!(
-                        "Failed: {}\n  {error} · Matter: {}",
-                        render_title(&item.title, color),
-                        item.id,
-                    );
+    for (item, document) in documents {
+        match document {
+            Ok(document) => {
+                if !scoring.score(item.id, document).await? {
+                    break;
                 }
             }
+            Err(error @ feed::ItemError::Unavailable) => {
+                scoring.unavailable(&item.id, item.title.as_deref(), error);
+            }
+            Err(error) => scoring.failed(&item.id, item.title.as_deref(), error),
         }
-
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    drop(receiver);
-    if !producer.is_finished() {
-        producer.abort();
-    }
-    match producer.await {
-        Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(error).context("Matter producer task failed"),
-    }
-    processing?;
-
-    if let Some(error) = list_error {
-        return Err(error).context("failed to list Matter items");
-    }
-    if failures > 0 {
-        bail!("failed to fetch {failures} Matter item(s)");
     }
 
-    let noun = if available == 1 {
-        "article"
-    } else {
-        "articles"
-    };
-    println!("Total: {total_words} words across {available} eligible {noun}.");
-    Ok(())
+    scoring.finish()
 }
 
 async fn score_file(path: PathBuf, global: GlobalArgs) -> Result<()> {
@@ -371,33 +425,29 @@ fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
-fn format_matter_document(
+fn format_item_document(
+    source: &str,
     item_id: &str,
     document: &Document,
     word_count: usize,
     color: bool,
 ) -> String {
-    let title = document
-        .title
-        .as_deref()
-        .filter(|title| !title.is_empty())
-        .unwrap_or("Untitled");
-    let mut output = render_title(title, color);
+    let mut output = render_title(display_title(document.title.as_deref()), color);
     if let Some(url) = &document.url {
-        use std::fmt::Write as _;
         write!(output, "\n  {url}").expect("writing to a String cannot fail");
     }
-    use std::fmt::Write as _;
-    write!(output, "\n  {word_count} words · Matter: {item_id}")
+    write!(output, "\n  {word_count} words · {source}: {item_id}")
         .expect("writing to a String cannot fail");
     output
 }
 
 fn format_document(document: &InputDocument, word_count: usize, color: bool) -> String {
     match document {
-        InputDocument::Matter { item_id, document } => {
-            format_matter_document(item_id, document, word_count, color)
-        }
+        InputDocument::Item {
+            source,
+            item_id,
+            document,
+        } => format_item_document(source, item_id, document, word_count, color),
         InputDocument::File { path, .. } => format!(
             "{}\n  {word_count} words · File",
             render_title(&path.display().to_string(), color)
@@ -415,8 +465,6 @@ fn format_scored_document(
     score: &pangram::Score,
     color: bool,
 ) -> String {
-    use std::fmt::Write as _;
-
     let mut output = format_document(document, word_count, color);
     write!(
         output,
@@ -432,13 +480,24 @@ fn format_scored_document(
     output
 }
 
-fn format_unavailable(item: &matter::Item, reason: &str, color: bool) -> String {
+fn format_item_issue(
+    kind: &str,
+    item_id: &str,
+    title: Option<&str>,
+    detail: impl fmt::Display,
+    source: &str,
+    color: bool,
+) -> String {
     format!(
-        "Unavailable: {}\n  {} · Matter: {}",
-        render_title(&item.title, color),
-        reason,
-        item.id,
+        "{kind}: {}\n  {detail} · {source}: {item_id}",
+        render_title(display_title(title), color),
     )
+}
+
+fn display_title(title: Option<&str>) -> &str {
+    title
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Untitled")
 }
 
 fn render_title(title: &str, color: bool) -> String {

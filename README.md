@@ -1,6 +1,6 @@
 <h1 align="center"><code>slopfilter</code></h1>
 
-`slopfilter` runs saved [Matter] articles through [Pangram], rating them by their likelyhood of being LLM authored. Somewhat ironically, it was conceived in a single weekend and is fully LLM written. It is not pretty code by any means (and my own standards) but that does not make it any less useful in it's current form.
+`slopfilter` runs saved [Matter] articles and Atom/RSS feed entries through [Pangram], rating them by their likelyhood of being LLM authored. Somewhat ironically, it was conceived in a single weekend and is fully LLM written. It is not pretty code by any means (and my own standards) but that does not make it any less useful in it's current form.
 
 ## Usage
 
@@ -12,6 +12,7 @@ Usage: slopfilter <COMMAND>
 
 Commands:
   matter  Score Matter articles
+  feed    Score entries of an Atom or RSS feed
   file    Score a UTF-8 text or Markdown file
   stdin   Score UTF-8 text piped on standard input
   help    Print this message or the help of the given subcommand(s)

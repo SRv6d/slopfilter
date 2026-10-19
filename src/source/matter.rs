@@ -2,7 +2,7 @@
 use std::{
     fmt::{self, Write as _},
     num::NonZeroU32,
-    sync::Arc,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -16,25 +16,23 @@ use reqwest::{
 };
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
-use tokio::{
-    sync::Mutex,
-    time::{Instant, sleep_until},
-};
+use tokio::time::{Instant, sleep_until};
 use url::Url;
 
 const API_BASE_URL: &str = "https://api.getmatter.com/public/v1/";
 const MAX_BURST_REQUESTS_PER_SECOND: u32 = 5;
+const MAX_CONCURRENT_CONTENT_REQUESTS: usize = 4;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_RETRIES: u8 = 3;
+/// Bounds each request through the end of its response body.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ITEMS_PER_PAGE: usize = 100;
-const MAX_CONCURRENT_CONTENT_REQUESTS: usize = 4;
 
-#[derive(Clone)]
 pub(crate) struct Client {
     http: HttpClient,
     token: String,
     base_url: Url,
-    content_gate: Arc<ContentRequestGate>,
+    content_gate: ContentRequestGate,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -116,6 +114,11 @@ pub(crate) enum ItemError {
     RateLimited { id: String, retries: u8 },
 }
 
+/// A listed item with its document, or the item-scoped reason it has none.
+type ListedDocument = Result<(Item, Result<Document, ItemError>), Error>;
+
+/// Admits Markdown requests as fast as Matter's burst ceiling allows until the
+/// server answers `429`; then every request waits out its `Retry-After`.
 struct ContentRequestGate {
     burst_limiter: DefaultDirectRateLimiter,
     deferred_until: Mutex<Instant>,
@@ -134,29 +137,46 @@ impl ContentRequestGate {
 
     async fn acquire(&self) {
         loop {
-            let deferred_until = *self.deferred_until.lock().await;
-            sleep_until(deferred_until.max(Instant::now())).await;
+            sleep_until(self.deferred_until()).await;
             self.burst_limiter.until_ready().await;
 
-            if *self.deferred_until.lock().await <= Instant::now() {
+            // A concurrent request may have been rate limited while this one waited.
+            if self.deferred_until() <= Instant::now() {
                 return;
             }
         }
     }
 
-    async fn defer(&self, delay: Duration) {
-        let mut deferred_until = self.deferred_until.lock().await;
+    fn defer(&self, delay: Duration) {
+        let mut deferred_until = self
+            .deferred_until
+            .lock()
+            .expect("the Matter content gate lock is not poisoned");
         *deferred_until = (*deferred_until).max(Instant::now() + delay);
+    }
+
+    fn deferred_until(&self) -> Instant {
+        *self
+            .deferred_until
+            .lock()
+            .expect("the Matter content gate lock is not poisoned")
     }
 }
 
 impl Client {
     pub(crate) fn new(token: String) -> Self {
+        Self::with_base_url(
+            token,
+            Url::parse(API_BASE_URL).expect("the Matter API base URL is valid"),
+        )
+    }
+
+    fn with_base_url(token: String, base_url: Url) -> Self {
         Self {
             http: HttpClient::new(),
             token,
-            base_url: Url::parse(API_BASE_URL).expect("the Matter API base URL is valid"),
-            content_gate: Arc::new(ContentRequestGate::new()),
+            base_url,
+            content_gate: ContentRequestGate::new(),
         }
     }
 
@@ -180,6 +200,7 @@ impl Client {
                     .http
                     .get(self.endpoint("items"))
                     .bearer_auth(&self.token)
+                    .timeout(REQUEST_TIMEOUT)
                     .query(&[
                         ("status", statuses.as_str()),
                         ("content_type", "article"),
@@ -215,29 +236,24 @@ impl Client {
         }
     }
 
-    pub(crate) fn list_items_with_markdown(
+    /// Fetches up to four Markdown bodies concurrently and yields them in list order.
+    pub(crate) fn list_documents(
         &self,
         options: ListOptions,
-    ) -> impl Stream<Item = Result<(Item, Result<(), ItemError>), Error>> + '_ {
-        let client = self.clone();
-
+    ) -> impl Stream<Item = ListedDocument> + '_ {
         self.list_items(options)
-            .map(move |listed| {
-                let client = client.clone();
-
-                async move {
-                    let mut item = listed?;
-                    let outcome = client.include_markdown(&mut item).await;
-                    Ok::<_, Error>((item, outcome))
-                }
+            .map(move |listed| async move {
+                let item = listed?;
+                let document = self.document(&item).await;
+                Ok((item, document))
             })
             .buffered(MAX_CONCURRENT_CONTENT_REQUESTS)
     }
 
-    async fn include_markdown(&self, item: &mut Item) -> Result<(), ItemError> {
+    async fn document(&self, item: &Item) -> Result<Document, ItemError> {
+        // Listed items that are still processing cannot have Markdown; skip the content request.
         item.ensure_processed()?;
-        *item = self.item(&item.id).await?;
-        item.ensure_markdown_available()
+        self.item(&item.id).await?.into_document()
     }
 
     async fn item(&self, id: &str) -> Result<Item, ItemError> {
@@ -249,6 +265,7 @@ impl Client {
                 .get(self.endpoint(&format!("items/{id}")))
                 .bearer_auth(&self.token)
                 .query(&[("include", "markdown")])
+                .timeout(REQUEST_TIMEOUT)
                 .send()
                 .await
                 .map_err(|source| ItemError::Fetch {
@@ -257,9 +274,7 @@ impl Client {
                 })?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                self.content_gate
-                    .defer(retry_after(response.headers()))
-                    .await;
+                self.content_gate.defer(retry_after(response.headers()));
 
                 if attempt == MAX_RATE_LIMIT_RETRIES {
                     return Err(ItemError::RateLimited {
@@ -340,37 +355,14 @@ impl Item {
         Ok(())
     }
 
-    fn ensure_markdown_available(&self) -> Result<(), ItemError> {
+    fn into_document(self) -> Result<Document, ItemError> {
         self.ensure_processed()?;
-
-        if self
-            .markdown
-            .as_ref()
-            .is_none_or(|markdown| markdown.trim().is_empty())
-        {
-            return Err(ItemError::Unavailable {
-                reason: "Matter returned no extracted Markdown".to_owned(),
-            });
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn into_document(self) -> Result<(String, Document), ItemError> {
         let Self {
-            id,
             title,
             url,
-            processing_status,
             markdown,
+            ..
         } = self;
-        let title = title.trim().to_owned();
-
-        if processing_status != "completed" {
-            return Err(ItemError::Unavailable {
-                reason: format!("content extraction is {processing_status}"),
-            });
-        }
 
         let Some(markdown) = markdown.filter(|markdown| !markdown.trim().is_empty()) else {
             return Err(ItemError::Unavailable {
@@ -378,14 +370,11 @@ impl Item {
             });
         };
 
-        Ok((
-            id,
-            Document {
-                title: Some(title),
-                url,
-                text: markdown,
-            },
-        ))
+        Ok(Document {
+            title: Some(title.trim().to_owned()),
+            url,
+            text: markdown,
+        })
     }
 }
 
@@ -394,7 +383,6 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        sync::Arc,
         thread,
         time::Duration,
     };
@@ -404,8 +392,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        Client, ContentRequestGate, DEFAULT_RETRY_AFTER, Item, ItemError, ListOptions, Status,
-        comma_separated, retry_after,
+        Client, DEFAULT_RETRY_AFTER, Item, ItemError, ListOptions, Status, comma_separated,
+        retry_after,
     };
 
     #[test]
@@ -424,12 +412,7 @@ mod tests {
     #[tokio::test]
     async fn list_items_follows_pagination_until_the_requested_limit() {
         let (base_url, server) = pagination_server(["limit=2", "limit=1"]);
-        let client = Client {
-            http: reqwest::Client::new(),
-            token: "secret-token".to_owned(),
-            base_url,
-            content_gate: Arc::new(ContentRequestGate::new()),
-        };
+        let client = Client::with_base_url("secret-token".to_owned(), base_url);
         let items = client.list_items(ListOptions {
             status: vec![Status::Queue],
             tag: Vec::new(),
@@ -449,12 +432,7 @@ mod tests {
     #[tokio::test]
     async fn list_items_without_a_limit_exhausts_all_pages() {
         let (base_url, server) = pagination_server(["limit=100", "limit=100"]);
-        let client = Client {
-            http: reqwest::Client::new(),
-            token: "secret-token".to_owned(),
-            base_url,
-            content_gate: Arc::new(ContentRequestGate::new()),
-        };
+        let client = Client::with_base_url("secret-token".to_owned(), base_url);
         let items = client.list_items(ListOptions {
             status: vec![Status::Queue],
             tag: Vec::new(),
@@ -506,24 +484,22 @@ mod tests {
             assert!(read_request(&mut stream).starts_with("GET /items/itm_first?include=markdown"));
             write_status_response(&mut stream, "500 Internal Server Error", "{}");
         });
-        let client = Client {
-            http: reqwest::Client::new(),
-            token: "secret-token".to_owned(),
-            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
-            content_gate: Arc::new(ContentRequestGate::new()),
-        };
-        let items = client.list_items_with_markdown(ListOptions {
+        let client = Client::with_base_url(
+            "secret-token".to_owned(),
+            Url::parse(&format!("http://{address}/")).unwrap(),
+        );
+        let items = client.list_documents(ListOptions {
             status: vec![Status::Queue],
             tag: Vec::new(),
             limit: None,
         });
         pin_mut!(items);
 
-        let (item, outcome) = items.next().await.unwrap().unwrap();
+        let (item, document) = items.next().await.unwrap().unwrap();
 
         assert_eq!(item.id, "itm_first");
         assert!(matches!(
-            outcome,
+            document,
             Err(ItemError::Fetch { id, .. }) if id == "itm_first"
         ));
         assert!(items.next().await.is_none());
@@ -628,7 +604,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, document) = item.into_document().unwrap();
+        let document = item.into_document().unwrap();
 
         assert_eq!(document.title.as_deref(), Some("A saved article"));
         assert_eq!(
@@ -652,7 +628,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, document) = item.into_document().unwrap();
+        let document = item.into_document().unwrap();
 
         assert_eq!(document.url, None);
         assert_eq!(document.text, "Article body");
@@ -670,7 +646,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, document) = item.into_document().unwrap();
+        let document = item.into_document().unwrap();
 
         assert_eq!(document.url, None);
         assert_eq!(document.text, "Article body");

@@ -1,5 +1,7 @@
 //! Atom and RSS source adapter.
 
+use std::time::Duration;
+
 use feed_rs::{
     model::{Entry as ParsedEntry, Text},
     parser,
@@ -11,20 +13,25 @@ use url::Url;
 use super::Document;
 
 const HTML_TEXT_WIDTH: usize = 120;
+/// Bounds the feed request through the end of its response body.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Default)]
-pub struct Client {
+pub(crate) struct Client {
     http: HttpClient,
 }
 
+/// Display metadata for a feed entry, kept alongside its document outcome.
 #[derive(Debug)]
-pub struct Item {
-    entry: ParsedEntry,
-    url: Option<Url>,
+pub(crate) struct Item {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
 }
 
+/// A feed entry with its document, or the item-scoped reason it has none.
+type EntryDocument = (Item, Result<Document, ItemError>);
+
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("failed to fetch feed")]
     Fetch(#[from] reqwest::Error),
 
@@ -33,68 +40,37 @@ pub enum Error {
 }
 
 #[derive(Debug, Error)]
-pub enum ItemError {
-    #[error("feed item {id} has no inline text content or summary")]
-    Unavailable { id: String },
+pub(crate) enum ItemError {
+    #[error("no inline full-text content; summaries are not scored")]
+    Unavailable,
 
-    #[error("feed item {id} content could not be normalized")]
-    InvalidContent {
-        id: String,
-        #[source]
-        source: html2text::Error,
-    },
+    #[error("content could not be normalized")]
+    InvalidContent(#[source] html2text::Error),
 }
 
 impl Client {
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn new() -> Self {
+        Self {
+            http: HttpClient::new(),
+        }
     }
 
-    pub async fn fetch_items(&self, feed_url: Url) -> Result<Vec<Item>, Error> {
+    pub(crate) async fn fetch_documents(&self, feed_url: Url) -> Result<Vec<EntryDocument>, Error> {
         let bytes = self
             .http
             .get(feed_url.clone())
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?
             .error_for_status()?
             .bytes()
             .await?;
 
-        parse_items(&feed_url, &bytes)
+        parse_documents(&feed_url, &bytes)
     }
 }
 
-impl Item {
-    pub fn id(&self) -> &str {
-        &self.entry.id
-    }
-
-    pub fn into_document(self) -> Result<(String, Document), ItemError> {
-        let Self { entry, url } = self;
-        let title = entry
-            .title
-            .as_ref()
-            .map(display_text)
-            .transpose()
-            .map_err(|source| ItemError::InvalidContent {
-                id: entry.id.clone(),
-                source,
-            })?
-            .flatten();
-        let text = item_text(&entry)
-            .map_err(|source| ItemError::InvalidContent {
-                id: entry.id.clone(),
-                source,
-            })?
-            .ok_or_else(|| ItemError::Unavailable {
-                id: entry.id.clone(),
-            })?;
-
-        Ok((entry.id, Document { title, url, text }))
-    }
-}
-
-pub fn parse_items(feed_url: &Url, bytes: &[u8]) -> Result<Vec<Item>, Error> {
+fn parse_documents(feed_url: &Url, bytes: &[u8]) -> Result<Vec<EntryDocument>, Error> {
     let feed = parser::Builder::new()
         .base_uri(Some(feed_url.as_str()))
         .build()
@@ -103,11 +79,33 @@ pub fn parse_items(feed_url: &Url, bytes: &[u8]) -> Result<Vec<Item>, Error> {
     Ok(feed
         .entries
         .into_iter()
-        .map(|entry| {
-            let url = item_url(feed_url, &entry);
-            Item { entry, url }
-        })
+        .map(|entry| entry_document(feed_url, entry))
         .collect())
+}
+
+fn entry_document(feed_url: &Url, entry: ParsedEntry) -> EntryDocument {
+    // Titles are display metadata: one that cannot be normalized is absent, like a malformed URL.
+    let title = entry
+        .title
+        .as_ref()
+        .and_then(|title| display_text(title).ok().flatten());
+    let document = match item_text(&entry) {
+        Ok(Some(text)) => Ok(Document {
+            title: title.clone(),
+            url: item_url(feed_url, &entry),
+            text,
+        }),
+        Ok(None) => Err(ItemError::Unavailable),
+        Err(source) => Err(ItemError::InvalidContent(source)),
+    };
+
+    (
+        Item {
+            id: entry.id,
+            title,
+        },
+        document,
+    )
 }
 
 fn item_url(feed_url: &Url, entry: &ParsedEntry) -> Option<Url> {
@@ -126,20 +124,16 @@ fn item_url(feed_url: &Url, entry: &ParsedEntry) -> Option<Url> {
         })
 }
 
+/// Scores only full inline content; summaries are too short to score reliably.
 fn item_text(entry: &ParsedEntry) -> Result<Option<String>, html2text::Error> {
-    if let Some(content) = entry.content.as_ref()
-        && let Some(body) = content.body.as_deref()
-        && let Some(text) = scoreable_text(body, content.content_type.as_str())?
-    {
-        return Ok(Some(text));
-    }
+    let Some(content) = entry.content.as_ref() else {
+        return Ok(None);
+    };
+    let Some(body) = content.body.as_deref() else {
+        return Ok(None);
+    };
 
-    entry
-        .summary
-        .as_ref()
-        .map(|summary| scoreable_text(&summary.content, summary.content_type.as_str()))
-        .transpose()
-        .map(Option::flatten)
+    scoreable_text(body, content.content_type.as_str())
 }
 
 fn display_text(text: &Text) -> Result<Option<String>, html2text::Error> {
@@ -190,7 +184,7 @@ mod tests {
 
     #[test]
     fn atom_entries_map_in_feed_order() {
-        let items = parse_items(
+        let documents = parse_documents(
             &Url::parse(FEED_URL).unwrap(),
             br#"<?xml version="1.0" encoding="utf-8"?>
                 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -216,11 +210,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            items.iter().map(Item::id).collect::<Vec<_>>(),
+            documents
+                .iter()
+                .map(|(item, _)| item.id.as_str())
+                .collect::<Vec<_>>(),
             ["atom-first", "atom-second"]
         );
 
-        let (_, first) = items.into_iter().next().unwrap().into_document().unwrap();
+        let (item, first) = documents.into_iter().next().unwrap();
+        let first = first.unwrap();
+        assert_eq!(item.title.as_deref(), Some("First"));
         assert_eq!(first.title.as_deref(), Some("First"));
         assert_eq!(
             first.url.as_ref().map(Url::as_str),
@@ -230,8 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn rss_content_and_description_map_to_documents() {
-        let items = parse_items(
+    fn rss_encoded_content_is_scored_and_description_only_is_unavailable() {
+        let documents = parse_documents(
             &Url::parse(FEED_URL).unwrap(),
             br#"<?xml version="1.0"?>
                 <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
@@ -257,19 +256,17 @@ mod tests {
         )
         .unwrap();
 
-        let documents = items
-            .into_iter()
-            .map(Item::into_document)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let mut documents = documents.into_iter();
 
-        assert_eq!(documents[0].1.text, "Full entry.");
-        assert_eq!(documents[1].1.text, "Summary entry.");
+        assert_eq!(documents.next().unwrap().1.unwrap().text, "Full entry.");
+        let (item, summary_only) = documents.next().unwrap();
+        assert_eq!(item.title.as_deref(), Some("Summary entry"));
+        assert!(matches!(summary_only, Err(ItemError::Unavailable)));
     }
 
     #[test]
-    fn unsupported_full_content_falls_back_to_the_summary() {
-        let mut items = parse_items(
+    fn unsupported_content_does_not_fall_back_to_the_summary() {
+        let mut documents = parse_documents(
             &Url::parse(FEED_URL).unwrap(),
             br#"<feed xmlns="http://www.w3.org/2005/Atom">
                   <title>Example</title>
@@ -286,14 +283,15 @@ mod tests {
         )
         .unwrap();
 
-        let (_, document) = items.pop().unwrap().into_document().unwrap();
-
-        assert_eq!(document.text, "Scoreable summary");
+        assert!(matches!(
+            documents.pop().unwrap().1,
+            Err(ItemError::Unavailable)
+        ));
     }
 
     #[test]
-    fn entry_without_inline_content_or_summary_is_unavailable() {
-        let mut items = parse_items(
+    fn linked_content_is_unavailable() {
+        let mut documents = parse_documents(
             &Url::parse(FEED_URL).unwrap(),
             br#"<feed xmlns="http://www.w3.org/2005/Atom">
                   <title>Example</title>
@@ -310,16 +308,16 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            items.pop().unwrap().into_document(),
-            Err(ItemError::Unavailable { id }) if id == "linked-content"
+            documents.pop().unwrap().1,
+            Err(ItemError::Unavailable)
         ));
     }
 
     #[test]
     fn invalid_entry_url_is_ignored() {
-        let mut items = parse_items(
+        let mut documents = parse_documents(
             &Url::parse(FEED_URL).unwrap(),
-            br#"<rss version="2.0">
+            br#"<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
                   <channel>
                     <title>Example</title>
                     <link>https://example.com/</link>
@@ -328,14 +326,14 @@ mod tests {
                       <guid>bad-url</guid>
                       <title>Bad URL</title>
                       <link>http://[::1</link>
-                      <description>Article body</description>
+                      <content:encoded>Article body</content:encoded>
                     </item>
                   </channel>
                 </rss>"#,
         )
         .unwrap();
 
-        let (_, document) = items.pop().unwrap().into_document().unwrap();
+        let document = documents.pop().unwrap().1.unwrap();
 
         assert_eq!(document.url, None);
         assert_eq!(document.text, "Article body");
@@ -343,7 +341,7 @@ mod tests {
 
     #[test]
     fn invalid_feed_fails_before_producing_items() {
-        let error = parse_items(&Url::parse(FEED_URL).unwrap(), b"not a feed").unwrap_err();
+        let error = parse_documents(&Url::parse(FEED_URL).unwrap(), b"not a feed").unwrap_err();
 
         assert!(matches!(error, Error::InvalidFeed(_)));
     }
