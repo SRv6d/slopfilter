@@ -1,4 +1,8 @@
 //! Stateless client for Pangram's asynchronous text-detection API.
+mod bulk;
+
+pub(crate) use bulk::{BulkInput, BulkItemOutcome};
+
 use std::{ops::ControlFlow, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -171,10 +175,17 @@ struct TaskResponse {
 
 impl Client {
     pub(crate) fn new(api_key: String) -> Self {
+        Self::with_base_url(
+            api_key,
+            Url::parse(API_BASE_URL).expect("the Pangram API URL is valid"),
+        )
+    }
+
+    pub(crate) fn with_base_url(api_key: String, base_url: Url) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url: Url::parse(API_BASE_URL).expect("the Pangram API URL is valid"),
+            base_url,
         }
     }
 
@@ -420,180 +431,15 @@ fn validate_pending_task_id(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        ops::ControlFlow,
-        sync::Arc,
-        thread,
-    };
+    use std::ops::ControlFlow;
 
-    use super::{Client, Error, ScoreOutcome, TaskHandle, TaskResponse, TaskStage};
-    use url::Url;
+    use super::{Error, TaskHandle, TaskResponse, TaskStage};
 
     fn task() -> TaskHandle {
         TaskHandle {
             task_id: "task-123".to_owned(),
             model: "pangram-4".to_owned(),
         }
-    }
-
-    #[tokio::test]
-    async fn client_discovers_submits_and_polls_to_success() {
-        let (base_url, server) = lifecycle_server();
-        let client = Client {
-            http: reqwest::Client::new(),
-            api_key: Arc::from("secret-key"),
-            base_url,
-        };
-
-        let model = client.discover_model().await.unwrap();
-        let outcome = client.score("# An article", &model).await.unwrap();
-        server.join().unwrap();
-
-        let ScoreOutcome::Complete(score) = outcome else {
-            panic!("expected a completed score");
-        };
-        assert_eq!(model, "pangram-4");
-        assert_eq!(score.task_id, "task-123");
-        assert_eq!(score.model, "pangram-4");
-        assert_eq!(score.version, "4.0");
-        assert_eq!(score.prediction.short, "Human");
-    }
-
-    #[tokio::test]
-    async fn rejected_submission_includes_status_and_response_body() {
-        let (base_url, server) = rejected_submission_server();
-        let client = Client {
-            http: reqwest::Client::new(),
-            api_key: Arc::from("secret-key"),
-            base_url,
-        };
-
-        let model = client.discover_model().await.unwrap();
-        let error = client.score("# An article", &model).await.unwrap_err();
-        server.join().unwrap();
-        let message = error.to_string();
-
-        assert!(message.contains("HTTP 422"));
-        assert!(message.contains("requested model is not enabled"));
-    }
-
-    fn rejected_submission_server() -> (Url, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            assert!(read_request(&mut stream).starts_with("GET /models HTTP/1.1"));
-            write_response(&mut stream, r#"{"models":["pangram-4"]}"#);
-
-            let (mut stream, _) = listener.accept().unwrap();
-            assert!(read_request(&mut stream).starts_with("POST /task HTTP/1.1"));
-            write_status_response(
-                &mut stream,
-                "422 Unprocessable Entity",
-                r#"{"detail":"requested model is not enabled"}"#,
-            );
-        });
-
-        (base_url, server)
-    }
-
-    fn lifecycle_server() -> (Url, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let server = thread::spawn(move || {
-            let responses = [
-                r#"{"models":["pangram-4"]}"#,
-                r#"{"task_id":"task-123"}"#,
-                r#"{"task_id":"task-123","stage":"STAGE_PREPROCESSING"}"#,
-                r##"{
-                    "stage":"STAGE_SUCCESS",
-                    "text":"# An article",
-                    "version":"4.0",
-                    "headline":"Human Written",
-                    "prediction":"This text appears human-written.",
-                    "prediction_short":"Human",
-                    "fraction_ai":0.0,
-                    "fraction_ai_assisted":0.0,
-                    "fraction_human":1.0,
-                    "num_ai_segments":0,
-                    "num_ai_assisted_segments":0,
-                    "num_human_segments":1,
-                    "windows":[]
-                }"##,
-            ];
-
-            for (index, response) in responses.into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                assert!(
-                    request
-                        .to_ascii_lowercase()
-                        .contains("x-api-key: secret-key")
-                );
-
-                match index {
-                    0 => assert!(request.starts_with("GET /models HTTP/1.1")),
-                    1 => {
-                        assert!(request.starts_with("POST /task HTTP/1.1"));
-                        let (_, body) = request.split_once("\r\n\r\n").unwrap();
-                        let body: serde_json::Value = serde_json::from_str(body).unwrap();
-                        assert_eq!(body["text"], "# An article");
-                        assert_eq!(body["model"], "pangram-4");
-                        assert_eq!(body["public_dashboard_link"], false);
-                    }
-                    _ => assert!(request.starts_with("GET /task/task-123 HTTP/1.1")),
-                }
-
-                write_response(&mut stream, response);
-            }
-        });
-
-        (base_url, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4096];
-
-        loop {
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            assert!(bytes_read > 0, "connection closed before request completed");
-            request.extend_from_slice(&buffer[..bytes_read]);
-
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-
-            if request.len() >= body_start + content_length {
-                request.truncate(body_start + content_length);
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
-
-    fn write_response(stream: &mut TcpStream, body: &str) {
-        write_status_response(stream, "200 OK", body);
-    }
-
-    fn write_status_response(stream: &mut TcpStream, status: &str, body: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
     }
 
     #[test]

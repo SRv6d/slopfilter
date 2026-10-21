@@ -8,7 +8,7 @@ use std::{
 
 use super::Document;
 use async_stream::try_stream;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
     Client as HttpClient, StatusCode,
@@ -60,6 +60,7 @@ pub(crate) struct Item {
     #[serde(default, deserialize_with = "deserialize_url")]
     url: Option<Url>,
     processing_status: String,
+    word_count: Option<usize>,
     #[serde(default)]
     markdown: Option<String>,
 }
@@ -113,9 +114,6 @@ pub(crate) enum ItemError {
     #[error("Matter rate limit persisted while fetching {id} after {retries} retries")]
     RateLimited { id: String, retries: u8 },
 }
-
-/// A listed item with its document, or the item-scoped reason it has none.
-type ListedDocument = Result<(Item, Result<Document, ItemError>), Error>;
 
 /// Admits Markdown requests as fast as Matter's burst ceiling allows until the
 /// server answers `429`; then every request waits out its `Retry-After`.
@@ -236,18 +234,17 @@ impl Client {
         }
     }
 
-    /// Fetches up to four Markdown bodies concurrently and yields them in list order.
-    pub(crate) fn list_documents(
+    /// Fetches selected Markdown bodies up to four at a time and returns them
+    /// in the same order as `items`.
+    pub(crate) async fn fetch_documents(
         &self,
-        options: ListOptions,
-    ) -> impl Stream<Item = ListedDocument> + '_ {
-        self.list_items(options)
-            .map(move |listed| async move {
-                let item = listed?;
-                let document = self.document(&item).await;
-                Ok((item, document))
-            })
+        items: &[&Item],
+    ) -> Vec<Result<Document, ItemError>> {
+        stream::iter(items)
+            .map(|item| self.document(item))
             .buffered(MAX_CONCURRENT_CONTENT_REQUESTS)
+            .collect()
+            .await
     }
 
     async fn document(&self, item: &Item) -> Result<Document, ItemError> {
@@ -345,6 +342,13 @@ struct ItemList {
 }
 
 impl Item {
+    pub(crate) fn estimated_word_count(&self) -> Result<usize, ItemError> {
+        self.ensure_processed()?;
+        self.word_count.ok_or_else(|| ItemError::Unavailable {
+            reason: "Matter returned no estimated word count".to_owned(),
+        })
+    }
+
     fn ensure_processed(&self) -> Result<(), ItemError> {
         if self.processing_status != "completed" {
             return Err(ItemError::Unavailable {
@@ -488,21 +492,22 @@ mod tests {
             "secret-token".to_owned(),
             Url::parse(&format!("http://{address}/")).unwrap(),
         );
-        let items = client.list_documents(ListOptions {
+        let items = client.list_items(ListOptions {
             status: vec![Status::Queue],
             tag: Vec::new(),
             limit: None,
         });
         pin_mut!(items);
+        let item = items.next().await.unwrap().unwrap();
+        assert!(items.next().await.is_none());
 
-        let (item, document) = items.next().await.unwrap().unwrap();
+        let documents = client.fetch_documents(&[&item]).await;
 
         assert_eq!(item.id, "itm_first");
         assert!(matches!(
-            document,
+            &documents[0],
             Err(ItemError::Fetch { id, .. }) if id == "itm_first"
         ));
-        assert!(items.next().await.is_none());
         server.join().unwrap();
     }
 
@@ -577,18 +582,37 @@ mod tests {
     }
 
     #[test]
-    fn listed_item_can_omit_markdown() {
+    fn listed_item_preserves_estimated_word_count_without_markdown() {
         let item: Item = serde_json::from_str(
             r#"{
                 "id": "itm_123",
                 "title": "A saved article",
                 "url": "https://example.com/article",
-                "processing_status": "completed"
+                "processing_status": "completed",
+                "word_count": 321
             }"#,
         )
         .unwrap();
 
         assert!(item.markdown.is_none());
+        assert_eq!(item.estimated_word_count().unwrap(), 321);
+    }
+    #[test]
+    fn listed_item_without_an_estimate_is_unavailable_for_selection() {
+        let item: Item = serde_json::from_str(
+            r#"{
+                "id": "itm_123",
+                "title": "A saved article",
+                "processing_status": "completed"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            item.estimated_word_count(),
+            Err(ItemError::Unavailable { reason })
+                if reason == "Matter returned no estimated word count"
+        ));
     }
 
     #[test]

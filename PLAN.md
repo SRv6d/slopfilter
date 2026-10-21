@@ -8,10 +8,14 @@ Implemented:
 
 - `matter` reads `MATTER_API_TOKEN`, paginates every selected article, and
   supports repeated status and tag filters plus an optional total item limit.
-- Matter fetches up to four Markdown bodies concurrently at Matter's burst
-  ceiling, pauses all requests on `429 Retry-After`, and preserves list order.
-- `feed <URL>` fetches an Atom or RSS feed once and scores entries in feed
+- Matter discovers and displays every candidate before content fetching, uses
+  each listing's estimated `word_count` for initial budget admission, fetches
+  Markdown only for selected items, and re-checks the actual Markdown count.
+- Matter fetches selected Markdown bodies up to four at a time at Matter's
+  burst ceiling, pauses all requests on `429 Retry-After`, and preserves list
   order.
+- `feed <URL>` fetches an Atom or RSS feed once and prepares entries in feed
+  order using their actual inline-content word counts.
 - Feed entries preserve source order, resolve relative links, and convert
   embedded HTML to scoreable text. Only full inline content (Atom `content`,
   RSS `content:encoded`) is scored; summary- or description-only entries are
@@ -22,15 +26,21 @@ Implemented:
   URLs as absent optional metadata rather than failing scoreable items.
 - Matter and feed requests time out after 30 seconds, including the response
   body; Pangram requests time out after 10 seconds.
-- Matter, feed, file, and standard-input documents use Pangram's realtime task
-  API.
-- Matter and feed adapters both yield `(Item, Result<Document, ItemError>)`.
-  `ItemScoring` in `main.rs` applies one word budget, reports `Unavailable` and
-  `Failed` items identically, and prints the run total.
+- Matter and feed documents use Pangram's bulk API. Prepared documents are
+  partitioned at 1,000 billable units—one unit per started 100-word block per
+  item, minimum one—and jobs are submitted and polled sequentially.
+- Matter and feed runs track pending, unavailable, failed, budget-skipped,
+  submitted, pending-at-Pangram, dry-run, and completed item states.
+- Pangram bulk submission and results are matched by source item ID, then
+  reported in source order so one item failure does not suppress siblings.
+- File and standard-input documents remain on Pangram's realtime task API,
+  whose scorer returns a flat dry-run-or-Pangram outcome; word-budget
+  admission is separate.
 - Pangram responses model terminal results, pending tasks, detailed
   predictions, fractions, segments, and windows.
-- Dry runs execute source discovery and the cumulative word budget without
-  contacting Pangram or requiring `PANGRAM_API_KEY`.
+- Dry runs complete source discovery, budget admission, Matter preparation,
+  and bulk partitioning without contacting Pangram or requiring
+  `PANGRAM_API_KEY`.
 - Output leads with the article title, file path, or standard-input label.
   Matter and feed entry IDs remain diagnostic metadata. Terminal titles are
   bold; piped output and `NO_COLOR` output remain plain.
@@ -40,22 +50,20 @@ Implemented:
 
 ### Matter request model
 
-- Listing, Markdown fetches, and Pangram scoring run in one task. Up to four
-  Markdown requests run concurrently, capped at Matter's 5/s burst ceiling, and
-  results are yielded in list order.
-- Requests go as fast as that allows until Matter answers `429`; every request
-  then waits out the server's `Retry-After` before continuing. The client does
-  not pre-space requests to the 20/min Markdown quota.
-- While an item is scored through the realtime task API the stream is not
-  polled, so pending fetches pause. Bulk scoring (milestone 1) removes that
-  wait.
-- Stopping at the word budget drops the stream and cancels at most four
-  in-flight fetches.
+- Listing completes and every candidate is displayed before any Markdown
+  request starts.
+- Estimated counts admit only documents expected to fit `--max-words`; up to
+  four selected Markdown requests then run concurrently and yield in list
+  order. Actual Markdown counts are admitted again before bulk partitioning.
+- Requests go as fast as Matter's burst ceiling allows until Matter answers
+  `429`; every request then waits out the server's `Retry-After` before
+  continuing. The client does not pre-space requests to the 20/min Markdown
+  quota.
+- All Markdown preparation completes before the first Pangram request. Pangram
+  bulk jobs are never overlapped.
 
 Not implemented:
 
-- No Pangram bulk scoring; Matter Markdown is fetched for each listed item
-  before word-budget admission.
 - No SQLite state, migrations, or Pangram result persistence.
 - No incremental Matter sync, body hash, or persisted resume support.
 - No report, filtering, or Matter write-back.
@@ -67,6 +75,8 @@ Not implemented:
 ## Next milestones
 
 ### 1. Sequential Pangram bulk scoring
+
+Status: completed.
 
 Score Matter and feed selections through Pangram's bulk API instead of creating
 one realtime task per article.
