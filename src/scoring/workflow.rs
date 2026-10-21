@@ -280,7 +280,10 @@ pub(crate) async fn execute_source_items(
     if !jobs.is_empty() {
         let api_key =
             pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
-        let client = pangram::Client::new(api_key, pangram_api_base_url);
+        let client = match pangram_api_base_url {
+            Some(base_url) => pangram::Client::with_base_url(api_key, base_url),
+            None => pangram::Client::new(api_key),
+        };
         let model = client
             .discover_model()
             .await

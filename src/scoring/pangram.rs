@@ -174,12 +174,18 @@ struct TaskResponse {
 }
 
 impl Client {
-    pub(crate) fn new(api_key: String, base_url: Option<Url>) -> Self {
+    pub(crate) fn new(api_key: String) -> Self {
+        Self::with_base_url(
+            api_key,
+            Url::parse(API_BASE_URL).expect("the Pangram API URL is valid"),
+        )
+    }
+
+    pub(crate) fn with_base_url(api_key: String, base_url: Url) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url: base_url
-                .unwrap_or_else(|| Url::parse(API_BASE_URL).expect("the Pangram API URL is valid")),
+            base_url,
         }
     }
 
