@@ -249,7 +249,7 @@ async fn score_matter(
         candidates[index].1.budget_skipped(exhausted, color);
     }
     for index in actual.admitted {
-        candidates[index].1.mark_ready(color);
+        candidates[index].1.mark_awaiting_submission(color);
     }
 
     let mut items = candidates
@@ -301,7 +301,7 @@ async fn score_feed(feed_url: Url, global: GlobalArgs) -> Result<()> {
         items[index].budget_skipped(exhausted, color);
     }
     for index in admission.admitted {
-        items[index].mark_ready(color);
+        items[index].mark_awaiting_submission(color);
     }
 
     scoring::execute_source_items(

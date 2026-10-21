@@ -20,7 +20,7 @@ const MAX_PANGRAM_BULK_UNITS: usize = 1_000;
 enum ItemState {
     Pending,
     Fetching,
-    Ready,
+    AwaitingSubmission,
     Unavailable,
     Failed,
     BudgetSkipped,
@@ -35,7 +35,7 @@ impl fmt::Display for ItemState {
         formatter.write_str(match self {
             Self::Pending => "Pending",
             Self::Fetching => "Fetching",
-            Self::Ready => "Ready",
+            Self::AwaitingSubmission => "Awaiting submission",
             Self::Unavailable => "Unavailable",
             Self::Failed => "Failed",
             Self::BudgetSkipped => "Skipped by word budget",
@@ -125,14 +125,14 @@ impl ScoringItem {
         Ok(word_count)
     }
 
-    pub(crate) fn mark_ready(&mut self, color: bool) {
+    pub(crate) fn mark_awaiting_submission(&mut self, color: bool) {
         let words = self
             .word_count
             .expect("an admitted source item has a word count");
         let units = billable_units(words);
         self.units = Some(units);
         let detail = format!("{words} words · {units} Pangram units");
-        self.transition(ItemState::Ready, Some(&detail), color);
+        self.transition(ItemState::AwaitingSubmission, Some(&detail), color);
     }
 }
 
@@ -180,9 +180,11 @@ fn billable_units(words: usize) -> usize {
 fn partition(items: &mut [ScoringItem], color: bool) -> Vec<BulkJob> {
     for item in items
         .iter_mut()
-        .filter(|item| item.state == ItemState::Ready)
+        .filter(|item| item.state == ItemState::AwaitingSubmission)
     {
-        let units = item.units.expect("ready source items have Pangram units");
+        let units = item
+            .units
+            .expect("items awaiting submission have Pangram units");
         if units > MAX_PANGRAM_BULK_UNITS {
             let detail = format!(
                 "requires {units} Pangram units; one bulk item cannot exceed {MAX_PANGRAM_BULK_UNITS}"
@@ -195,10 +197,12 @@ fn partition(items: &mut [ScoringItem], color: bool) -> Vec<BulkJob> {
     let mut current = BulkJob::default();
     let mut current_ids = HashSet::<&str>::new();
     for (index, item) in items.iter().enumerate() {
-        if item.state != ItemState::Ready {
+        if item.state != ItemState::AwaitingSubmission {
             continue;
         }
-        let units = item.units.expect("ready source items have Pangram units");
+        let units = item
+            .units
+            .expect("items awaiting submission have Pangram units");
         let duplicate_id = current_ids.contains(item.id.as_str());
         if !current.indices.is_empty()
             && (current.units + units > MAX_PANGRAM_BULK_UNITS || duplicate_id)
@@ -578,7 +582,7 @@ mod tests {
             source: "Feed",
             id: id.to_owned(),
             title: Some(id.to_owned()),
-            state: ItemState::Ready,
+            state: ItemState::AwaitingSubmission,
             document: Some(PreparedDocument {
                 document: InputDocument::Item {
                     source: "Feed",

@@ -91,14 +91,14 @@ async fn feed_runs_sequential_bulk_jobs_and_maps_item_results_in_source_order() 
         "{diagnostic}"
     );
 
-    let first_ready = stderr.find("Ready:").expect(&diagnostic);
+    let first_awaiting_submission = stderr.find("Awaiting submission:").expect(&diagnostic);
     for title in ["First", "Second", "Third", "Fourth"] {
         let pending = stderr
             .find(&format!("Pending: {title}"))
             .unwrap_or_else(|| panic!("missing pending state for {title}\n{diagnostic}"));
         assert!(
-            pending < first_ready,
-            "{title} was not displayed before any item became ready\n{diagnostic}"
+            pending < first_awaiting_submission,
+            "{title} was not displayed before any item awaited submission\n{diagnostic}"
         );
     }
 
