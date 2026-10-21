@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     future,
     io::{self, Write as _},
     sync::{Arc, Mutex},
@@ -262,21 +263,34 @@ fn text_response(status: u16, body: &str) -> ResponseTemplate {
 
 fn demo_feed() -> String {
     let entries = [
-        ("mock-first", "First mock article", repeated_word("first", 99_800)),
-        ("mock-second", "Second mock article", repeated_word("second", 100)),
-        ("mock-third", "Third mock article", repeated_word("third", 100)),
+        (
+            "mock-first",
+            "First mock article",
+            repeated_word("first", 99_800),
+        ),
+        (
+            "mock-second",
+            "Second mock article",
+            repeated_word("second", 100),
+        ),
+        (
+            "mock-third",
+            "Third mock article",
+            repeated_word("third", 100),
+        ),
         ("mock-fourth", "Fourth mock article", "fourth".to_owned()),
-    ]
-    .into_iter()
-    .map(|(id, title, content)| {
-        format!(
+    ];
+    let mut entries_xml = String::new();
+    for (id, title, content) in entries {
+        write!(
+            entries_xml,
             "<entry><title>{title}</title><id>{id}</id><updated>2025-01-01T00:00:00Z</updated><content type=\"text\">{content}</content></entry>"
         )
-    })
-    .collect::<String>();
+        .unwrap();
+    }
 
     format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Mock feed</title><id>mock-feed</id><updated>2025-01-01T00:00:00Z</updated>{entries}</feed>"
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Mock feed</title><id>mock-feed</id><updated>2025-01-01T00:00:00Z</updated>{entries_xml}</feed>"
     )
 }
 

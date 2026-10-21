@@ -1,6 +1,7 @@
 mod support;
 
 use std::{
+    fmt::Write as _,
     io::Write as _,
     process::{Command, Output, Stdio},
 };
@@ -95,7 +96,7 @@ async fn feed_runs_sequential_bulk_jobs_and_maps_item_results_in_source_order() 
     for title in ["First", "Second", "Third", "Fourth"] {
         let pending = stderr
             .find(&format!("Pending: {title}"))
-            .unwrap_or_else(|| panic!("missing pending state for {title}\n{diagnostic}"));
+            .unwrap_or_else(|| unreachable!("missing pending state for {title}\n{diagnostic}"));
         assert!(
             pending < first_awaiting_submission,
             "{title} was not displayed before any item awaited submission\n{diagnostic}"
@@ -212,17 +213,17 @@ fn feed_document() -> String {
         ("item-third", "Third", repeated_word("third", 100)),
         ("item-fourth", "Fourth", "fourth".to_owned()),
     ];
-    let entries = entries
-        .into_iter()
-        .map(|(id, title, content)| {
-            format!(
-                "<entry><title>{title}</title><id>{id}</id><updated>2025-01-01T00:00:00Z</updated><content type=\"text\">{content}</content></entry>"
-            )
-        })
-        .collect::<String>();
+    let mut entries_xml = String::new();
+    for (id, title, content) in entries {
+        write!(
+            entries_xml,
+            "<entry><title>{title}</title><id>{id}</id><updated>2025-01-01T00:00:00Z</updated><content type=\"text\">{content}</content></entry>"
+        )
+        .unwrap();
+    }
 
     format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Test feed</title><id>test-feed</id><updated>2025-01-01T00:00:00Z</updated>{entries}</feed>"
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Test feed</title><id>test-feed</id><updated>2025-01-01T00:00:00Z</updated>{entries_xml}</feed>"
     )
 }
 

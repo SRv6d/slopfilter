@@ -315,6 +315,9 @@ async fn execute_jobs(
     Ok(())
 }
 
+// Keep submission validation and ordered state transitions together so their mapping invariant
+// remains visible in one place.
+#[allow(clippy::too_many_lines)]
 async fn execute_job(
     client: &pangram::Client,
     model: &str,

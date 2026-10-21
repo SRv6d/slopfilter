@@ -322,8 +322,7 @@ fn retry_after(headers: &HeaderMap) -> Duration {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_RETRY_AFTER)
+        .map_or(DEFAULT_RETRY_AFTER, Duration::from_secs)
 }
 
 fn deserialize_url<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
