@@ -50,7 +50,7 @@ impl Scorer {
             let api_key =
                 pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
             Mode::Live {
-                client: pangram::Client::new(api_key, pangram_api_base_url)?,
+                client: pangram::Client::new(api_key, pangram_api_base_url),
                 model: None,
             }
         };

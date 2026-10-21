@@ -25,9 +25,6 @@ pub(crate) struct Client {
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
-    #[error("invalid Pangram API base URL: {0}")]
-    InvalidBaseUrl(&'static str),
-
     #[error("Pangram API request failed: {0}")]
     Request(#[from] reqwest::Error),
 
@@ -177,35 +174,13 @@ struct TaskResponse {
 }
 
 impl Client {
-    pub(crate) fn new(api_key: String, base_url: Option<Url>) -> Result<Self, Error> {
-        let mut base_url = base_url
-            .unwrap_or_else(|| Url::parse(API_BASE_URL).expect("the Pangram API URL is valid"));
-        if !matches!(base_url.scheme(), "http" | "https") {
-            return Err(Error::InvalidBaseUrl("must use HTTP or HTTPS"));
-        }
-        if base_url.cannot_be_a_base() {
-            return Err(Error::InvalidBaseUrl("must be an absolute base URL"));
-        }
-        if !base_url.username().is_empty() || base_url.password().is_some() {
-            return Err(Error::InvalidBaseUrl("must not contain credentials"));
-        }
-        if base_url.query().is_some() || base_url.fragment().is_some() {
-            return Err(Error::InvalidBaseUrl(
-                "must not contain a query or fragment",
-            ));
-        }
-        if !base_url.path().ends_with('/') {
-            base_url
-                .path_segments_mut()
-                .map_err(|_| Error::InvalidBaseUrl("must support path segments"))?
-                .push("");
-        }
-
-        Ok(Self {
+    pub(crate) fn new(api_key: String, base_url: Option<Url>) -> Self {
+        Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url,
-        })
+            base_url: base_url
+                .unwrap_or_else(|| Url::parse(API_BASE_URL).expect("the Pangram API URL is valid")),
+        }
     }
 
     pub(crate) async fn discover_model(&self) -> Result<String, Error> {
@@ -452,35 +427,13 @@ fn validate_pending_task_id(
 mod tests {
     use std::ops::ControlFlow;
 
-    use super::{Client, Error, TaskHandle, TaskResponse, TaskStage};
-    use url::Url;
+    use super::{Error, TaskHandle, TaskResponse, TaskStage};
 
     fn task() -> TaskHandle {
         TaskHandle {
             task_id: "task-123".to_owned(),
             model: "pangram-4".to_owned(),
         }
-    }
-
-    #[test]
-    fn client_normalizes_and_validates_its_base_url() {
-        let client = Client::new(
-            "secret-key".to_owned(),
-            Some(Url::parse("http://127.0.0.1:1234/api").unwrap()),
-        )
-        .unwrap();
-        assert_eq!(
-            client.endpoint("models").as_str(),
-            "http://127.0.0.1:1234/api/models"
-        );
-
-        assert!(matches!(
-            Client::new(
-                "secret-key".to_owned(),
-                Some(Url::parse("file:///tmp/pangram").unwrap())
-            ),
-            Err(Error::InvalidBaseUrl(_))
-        ));
     }
 
     #[test]
