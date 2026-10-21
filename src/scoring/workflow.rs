@@ -21,27 +21,38 @@ enum ItemState {
     Pending,
     Fetching,
     AwaitingSubmission,
+    Submitted,
+    Finished(ItemOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOutcome {
+    Completed,
     Unavailable,
     Failed,
     BudgetSkipped,
-    Submitted,
-    Completed,
-    DryRun,
     TimedOut,
 }
 
 impl fmt::Display for ItemState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("Pending"),
+            Self::Fetching => formatter.write_str("Fetching"),
+            Self::AwaitingSubmission => formatter.write_str("Awaiting submission"),
+            Self::Submitted => formatter.write_str("Submitted"),
+            Self::Finished(outcome) => outcome.fmt(formatter),
+        }
+    }
+}
+
+impl fmt::Display for ItemOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Pending => "Pending",
-            Self::Fetching => "Fetching",
-            Self::AwaitingSubmission => "Awaiting submission",
+            Self::Completed => "Completed",
             Self::Unavailable => "Unavailable",
             Self::Failed => "Failed",
             Self::BudgetSkipped => "Skipped by word budget",
-            Self::Submitted => "Submitted",
-            Self::Completed => "Completed",
-            Self::DryRun => "Dry run",
             Self::TimedOut => "Pangram timed out",
         })
     }
@@ -92,11 +103,19 @@ impl ScoringItem {
     }
 
     pub(crate) fn unavailable(&mut self, reason: impl fmt::Display, color: bool) {
-        self.transition(ItemState::Unavailable, Some(&reason), color);
+        self.transition(
+            ItemState::Finished(ItemOutcome::Unavailable),
+            Some(&reason),
+            color,
+        );
     }
 
     pub(crate) fn failed(&mut self, error: impl fmt::Display, color: bool) {
-        self.transition(ItemState::Failed, Some(&error), color);
+        self.transition(
+            ItemState::Finished(ItemOutcome::Failed),
+            Some(&error),
+            color,
+        );
     }
 
     pub(crate) fn budget_skipped(&mut self, exhausted: scoring::BudgetExhausted, color: bool) {
@@ -110,7 +129,11 @@ impl ScoringItem {
             "{} {word_noun} remaining, but this document requires {}",
             exhausted.remaining_words, exhausted.document_words
         );
-        self.transition(ItemState::BudgetSkipped, Some(&detail), color);
+        self.transition(
+            ItemState::Finished(ItemOutcome::BudgetSkipped),
+            Some(&detail),
+            color,
+        );
     }
 
     pub(crate) fn set_document(&mut self, document: Document) -> Result<usize> {
@@ -237,7 +260,6 @@ pub(crate) async fn execute_source_items(
                 job.units
             );
             for &index in &job.indices {
-                items[index].transition(ItemState::DryRun, None, color);
                 let document = items[index]
                     .document
                     .as_ref()
@@ -252,7 +274,7 @@ pub(crate) async fn execute_source_items(
                 );
             }
         }
-        return finish(items);
+        return finish(items, true);
     }
 
     if !jobs.is_empty() {
@@ -267,7 +289,7 @@ pub(crate) async fn execute_source_items(
         execute_jobs(&client, &model, &jobs, items, color).await?;
     }
 
-    finish(items)
+    finish(items, false)
 }
 async fn execute_jobs(
     client: &pangram::Client,
@@ -395,7 +417,7 @@ async fn execute_job(
     for (index, outcome) in ordered {
         match outcome {
             pangram::BulkItemOutcome::Complete { score, .. } => {
-                items[index].transition(ItemState::Completed, None, color);
+                items[index].transition(ItemState::Finished(ItemOutcome::Completed), None, color);
                 let document = items[index]
                     .document
                     .as_ref()
@@ -415,7 +437,11 @@ async fn execute_job(
                 let detail = format!(
                     "Pangram bulk {bulk_id} task {task_id} remains {status} and can be resumed"
                 );
-                items[index].transition(ItemState::TimedOut, Some(&detail), color);
+                items[index].transition(
+                    ItemState::Finished(ItemOutcome::TimedOut),
+                    Some(&detail),
+                    color,
+                );
             }
         }
     }
@@ -460,10 +486,10 @@ fn order_outcomes(
     Ok(ordered)
 }
 
-fn finish(items: &[ScoringItem]) -> Result<()> {
+fn finish(items: &[ScoringItem], dry_run: bool) -> Result<()> {
     let failures = items
         .iter()
-        .filter(|item| item.state == ItemState::Failed)
+        .filter(|item| item.state == ItemState::Finished(ItemOutcome::Failed))
         .count();
     if failures > 0 {
         bail!("failed to process {failures} source item(s)");
@@ -474,8 +500,8 @@ fn finish(items: &[ScoringItem]) -> Result<()> {
         .filter(|item| {
             matches!(
                 item.state,
-                ItemState::Completed | ItemState::DryRun | ItemState::TimedOut
-            )
+                ItemState::Finished(ItemOutcome::Completed | ItemOutcome::TimedOut)
+            ) || (dry_run && item.state == ItemState::AwaitingSubmission)
         })
         .collect::<Vec<_>>();
     let total_words = eligible.iter().try_fold(0usize, |total, item| {
