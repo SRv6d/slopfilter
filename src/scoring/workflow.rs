@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use url::Url;
 
 use crate::{
     InputDocument, PreparedDocument, display_title, format_document, format_scored_document,
@@ -246,7 +247,7 @@ pub(crate) async fn execute_source_items(
     items: &mut [ScoringItem],
     dry_run: bool,
     pangram_api_key: Option<String>,
-    pangram_api_base_url: Option<pangram::ApiBaseUrl>,
+    pangram_api_base_url: Option<Url>,
     color: bool,
 ) -> Result<()> {
     let jobs = partition(items, color);
@@ -279,7 +280,7 @@ pub(crate) async fn execute_source_items(
     if !jobs.is_empty() {
         let api_key =
             pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
-        let client = pangram::Client::new(api_key, pangram_api_base_url);
+        let client = pangram::Client::new(api_key, pangram_api_base_url)?;
         let model = client
             .discover_model()
             .await

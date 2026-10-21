@@ -6,6 +6,7 @@ mod workflow;
 pub(crate) use workflow::{ScoringItem, admit_in_order, execute_source_items};
 
 use anyhow::{Context, Result};
+use url::Url;
 
 pub(crate) struct Scorer {
     mode: Mode,
@@ -41,7 +42,7 @@ impl Scorer {
     pub(crate) fn new(
         dry_run: bool,
         pangram_api_key: Option<String>,
-        pangram_api_base_url: Option<pangram::ApiBaseUrl>,
+        pangram_api_base_url: Option<Url>,
     ) -> Result<Self> {
         let mode = if dry_run {
             Mode::DryRun
@@ -49,7 +50,7 @@ impl Scorer {
             let api_key =
                 pangram_api_key.context("Pangram API key is required unless --dry-run is set")?;
             Mode::Live {
-                client: pangram::Client::new(api_key, pangram_api_base_url),
+                client: pangram::Client::new(api_key, pangram_api_base_url)?,
                 model: None,
             }
         };

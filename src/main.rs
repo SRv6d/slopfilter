@@ -60,7 +60,7 @@ struct GlobalArgs {
         hide = true,
         value_name = "URL"
     )]
-    pangram_api_base_url: Option<scoring::pangram::ApiBaseUrl>,
+    pangram_api_base_url: Option<Url>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -607,27 +607,10 @@ mod tests {
     }
 
     #[test]
-    fn pangram_api_base_url_is_hidden_and_normalized() {
+    fn pangram_api_base_url_is_hidden_and_uses_url_parsing() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("pangram-api-base-url"));
         assert!(!help.contains("SLOPFILTER_PANGRAM_API_BASE_URL"));
-
-        let cli = Cli::try_parse_from([
-            "slopfilter",
-            "file",
-            "article.md",
-            "--dry-run",
-            "--pangram-api-base-url",
-            "http://127.0.0.1:1234/api",
-        ])
-        .unwrap();
-        let ScoreInput::File { global, .. } = cli.input else {
-            panic!("expected file input");
-        };
-        assert_eq!(
-            global.pangram_api_base_url.unwrap().to_string(),
-            "http://127.0.0.1:1234/api/"
-        );
 
         assert!(
             Cli::try_parse_from([
@@ -636,7 +619,18 @@ mod tests {
                 "article.md",
                 "--dry-run",
                 "--pangram-api-base-url",
-                "file:///tmp/pangram",
+                "http://127.0.0.1:1234/api",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "slopfilter",
+                "file",
+                "article.md",
+                "--dry-run",
+                "--pangram-api-base-url",
+                "not a URL",
             ])
             .is_err()
         );
