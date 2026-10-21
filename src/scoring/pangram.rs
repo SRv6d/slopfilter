@@ -3,7 +3,7 @@ mod bulk;
 
 pub(crate) use bulk::{BulkInput, BulkItemOutcome};
 
-use std::{ops::ControlFlow, sync::Arc, time::Duration};
+use std::{fmt, ops::ControlFlow, str::FromStr, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +15,42 @@ const API_KEY_HEADER: &str = "x-api-key";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+pub(crate) struct ApiBaseUrl(Url);
+
+impl FromStr for ApiBaseUrl {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut url =
+            Url::parse(value).map_err(|error| format!("invalid Pangram API URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Pangram API URL must use HTTP or HTTPS".to_owned());
+        }
+        if url.cannot_be_a_base() {
+            return Err("Pangram API URL must be an absolute base URL".to_owned());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("Pangram API URL must not contain credentials".to_owned());
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("Pangram API URL must not contain a query or fragment".to_owned());
+        }
+        if !url.path().ends_with('/') {
+            url.path_segments_mut()
+                .map_err(|_| "Pangram API URL must support path segments".to_owned())?
+                .push("");
+        }
+        Ok(Self(url))
+    }
+}
+
+impl fmt::Display for ApiBaseUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Client {
@@ -174,12 +210,13 @@ struct TaskResponse {
 }
 
 impl Client {
-    pub(crate) fn new(api_key: String, base_url: Option<Url>) -> Self {
+    pub(crate) fn new(api_key: String, base_url: Option<ApiBaseUrl>) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: base_url
-                .unwrap_or_else(|| Url::parse(API_BASE_URL).expect("the Pangram API URL is valid")),
+                .unwrap_or_else(|| API_BASE_URL.parse().expect("the Pangram API URL is valid"))
+                .0,
         }
     }
 

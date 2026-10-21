@@ -58,10 +58,9 @@ struct GlobalArgs {
         long,
         env = "SLOPFILTER_PANGRAM_API_BASE_URL",
         hide = true,
-        value_name = "URL",
-        value_parser = parse_pangram_api_base_url
+        value_name = "URL"
     )]
-    pangram_api_base_url: Option<Url>,
+    pangram_api_base_url: Option<scoring::pangram::ApiBaseUrl>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -515,31 +514,9 @@ fn parse_max_words(value: &str) -> std::result::Result<usize, String> {
     }
 }
 
-fn parse_pangram_api_base_url(value: &str) -> std::result::Result<Url, String> {
-    let mut url = Url::parse(value).map_err(|error| format!("invalid Pangram API URL: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("Pangram API URL must use HTTP or HTTPS".to_owned());
-    }
-    if url.cannot_be_a_base() {
-        return Err("Pangram API URL must be an absolute base URL".to_owned());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("Pangram API URL must not contain credentials".to_owned());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("Pangram API URL must not contain a query or fragment".to_owned());
-    }
-    if !url.path().ends_with('/') {
-        url.path_segments_mut()
-            .map_err(|_| "Pangram API URL must support path segments".to_owned())?
-            .push("");
-    }
-    Ok(url)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ScoreInput, matter, parse_pangram_api_base_url};
+    use super::{Cli, ScoreInput, matter};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -648,10 +625,20 @@ mod tests {
             panic!("expected file input");
         };
         assert_eq!(
-            global.pangram_api_base_url.unwrap().as_str(),
+            global.pangram_api_base_url.unwrap().to_string(),
             "http://127.0.0.1:1234/api/"
         );
 
-        assert!(parse_pangram_api_base_url("file:///tmp/pangram").is_err());
+        assert!(
+            Cli::try_parse_from([
+                "slopfilter",
+                "file",
+                "article.md",
+                "--dry-run",
+                "--pangram-api-base-url",
+                "file:///tmp/pangram",
+            ])
+            .is_err()
+        );
     }
 }

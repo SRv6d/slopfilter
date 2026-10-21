@@ -6,7 +6,6 @@ mod workflow;
 pub(crate) use workflow::{ScoringItem, admit_in_order, execute_source_items};
 
 use anyhow::{Context, Result};
-use url::Url;
 
 pub(crate) struct Scorer {
     mode: Mode,
@@ -42,7 +41,7 @@ impl Scorer {
     pub(crate) fn new(
         dry_run: bool,
         pangram_api_key: Option<String>,
-        pangram_api_base_url: Option<Url>,
+        pangram_api_base_url: Option<pangram::ApiBaseUrl>,
     ) -> Result<Self> {
         let mode = if dry_run {
             Mode::DryRun
