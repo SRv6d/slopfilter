@@ -19,8 +19,8 @@ const MAX_PANGRAM_BULK_UNITS: usize = 1_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemState {
     Pending,
-    Selected,
-    Prepared,
+    Fetching,
+    Ready,
     Unavailable,
     Failed,
     BudgetSkipped,
@@ -34,8 +34,8 @@ impl fmt::Display for ItemState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Pending => "Pending",
-            Self::Selected => "Selected",
-            Self::Prepared => "Prepared",
+            Self::Fetching => "Fetching",
+            Self::Ready => "Ready",
             Self::Unavailable => "Unavailable",
             Self::Failed => "Failed",
             Self::BudgetSkipped => "Skipped by word budget",
@@ -87,8 +87,8 @@ impl ScoringItem {
         self.transition(ItemState::Pending, None, color);
     }
 
-    pub(crate) fn selected(&mut self, color: bool) {
-        self.transition(ItemState::Selected, None, color);
+    pub(crate) fn fetching(&mut self, color: bool) {
+        self.transition(ItemState::Fetching, None, color);
     }
 
     pub(crate) fn unavailable(&mut self, reason: impl fmt::Display, color: bool) {
@@ -125,14 +125,14 @@ impl ScoringItem {
         Ok(word_count)
     }
 
-    pub(crate) fn prepare(&mut self, color: bool) {
+    pub(crate) fn mark_ready(&mut self, color: bool) {
         let words = self
             .word_count
             .expect("an admitted source item has a word count");
         let units = billable_units(words);
         self.units = Some(units);
         let detail = format!("{words} words · {units} Pangram units");
-        self.transition(ItemState::Prepared, Some(&detail), color);
+        self.transition(ItemState::Ready, Some(&detail), color);
     }
 }
 
@@ -180,11 +180,9 @@ fn billable_units(words: usize) -> usize {
 fn partition(items: &mut [ScoringItem], color: bool) -> Vec<BulkJob> {
     for item in items
         .iter_mut()
-        .filter(|item| item.state == ItemState::Prepared)
+        .filter(|item| item.state == ItemState::Ready)
     {
-        let units = item
-            .units
-            .expect("prepared source items have Pangram units");
+        let units = item.units.expect("ready source items have Pangram units");
         if units > MAX_PANGRAM_BULK_UNITS {
             let detail = format!(
                 "requires {units} Pangram units; one bulk item cannot exceed {MAX_PANGRAM_BULK_UNITS}"
@@ -197,12 +195,10 @@ fn partition(items: &mut [ScoringItem], color: bool) -> Vec<BulkJob> {
     let mut current = BulkJob::default();
     let mut current_ids = HashSet::<&str>::new();
     for (index, item) in items.iter().enumerate() {
-        if item.state != ItemState::Prepared {
+        if item.state != ItemState::Ready {
             continue;
         }
-        let units = item
-            .units
-            .expect("prepared source items have Pangram units");
+        let units = item.units.expect("ready source items have Pangram units");
         let duplicate_id = current_ids.contains(item.id.as_str());
         if !current.indices.is_empty()
             && (current.units + units > MAX_PANGRAM_BULK_UNITS || duplicate_id)
@@ -582,7 +578,7 @@ mod tests {
             source: "Feed",
             id: id.to_owned(),
             title: Some(id.to_owned()),
-            state: ItemState::Prepared,
+            state: ItemState::Ready,
             document: Some(PreparedDocument {
                 document: InputDocument::Item {
                     source: "Feed",
