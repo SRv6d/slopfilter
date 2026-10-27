@@ -487,7 +487,7 @@ mod tests {
         .unwrap();
 
         let ControlFlow::Break(score) = response.into_poll(&task()).unwrap() else {
-            panic!("expected a completed score");
+            unreachable!("expected a completed score");
         };
 
         assert_eq!(score.task_id, "task-123");

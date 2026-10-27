@@ -21,7 +21,7 @@ const DEFAULT_MAX_SCORE_WORDS: usize = 2_000;
 
 /// Inspect and score text for likely AI authorship.
 #[derive(Debug, Parser)]
-#[command(about)]
+#[command(about, version)]
 struct Cli {
     #[command(subcommand)]
     input: ScoreInput,
@@ -545,7 +545,7 @@ mod tests {
             ..
         } = cli.input
         else {
-            panic!("expected Matter input");
+            unreachable!("expected Matter input");
         };
 
         assert_eq!(list_options.limit, Some(101));
@@ -568,7 +568,7 @@ mod tests {
         ])
         .unwrap();
         let ScoreInput::Matter { list_options, .. } = cli.input else {
-            panic!("expected Matter input");
+            unreachable!("expected Matter input");
         };
 
         assert_eq!(list_options.status, [matter::Status::Queue]);

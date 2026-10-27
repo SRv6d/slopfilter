@@ -20,7 +20,7 @@ enum Mode {
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BudgetExhausted {
     pub(crate) document_words: usize,
     pub(crate) remaining_words: usize,

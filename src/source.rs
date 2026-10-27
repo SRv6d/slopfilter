@@ -14,6 +14,7 @@ pub struct Document {
 }
 
 impl Document {
+    #[must_use]
     pub fn word_count(&self) -> usize {
         self.text.split_whitespace().count()
     }

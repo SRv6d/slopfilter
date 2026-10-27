@@ -1,0 +1,62 @@
+---
+# Keep routine dependency maintenance low-noise, leave major updates visible,
+# and avoid adopting brand-new releases immediately.
+version: 2
+
+multi-ecosystem-groups:
+  rust-environment:
+    schedule:
+      interval: monthly
+      time: "23:30"
+      timezone: Etc/UTC
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 4
+    groups:
+      actions-non-major:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 8
+    groups:
+      cargo-development-non-major:
+        dependency-type: development
+        patterns: ["*"]
+        update-types: [minor, patch]
+      cargo-production-non-major:
+        dependency-type: production
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # rust-overlay must know about a Rust release before Nix can evaluate it.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    patterns: ["*"]
+    multi-ecosystem-group: rust-environment
+
+  - package-ecosystem: nix
+    directory: /
+    patterns: ["rust-overlay"]
+    cooldown:
+      exclude: ["rust-overlay"]
+    multi-ecosystem-group: rust-environment
+
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 3

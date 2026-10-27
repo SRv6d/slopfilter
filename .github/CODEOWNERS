@@ -1,0 +1,5 @@
+# Files impacting workflow and release security
+.github/ @SRv6d
+justfile @SRv6d
+Cargo.toml @SRv6d
+deny.toml @SRv6d
