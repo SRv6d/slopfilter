@@ -41,7 +41,18 @@ bump-version $VERSION: _check_clean_working _check_gh_cli (_validate_semver VERS
     #!/usr/bin/env bash
     set -euxo pipefail
 
-    sed -i 's/^version = .*/version = "'$VERSION'"/g' Cargo.toml
+    tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
+    awk -v version="$VERSION" '
+      $0 == "[package]" { in_package = 1 }
+      in_package && /^version = / {
+        print "version = \"" version "\""
+        in_package = 0
+        next
+      }
+      { print }
+    ' Cargo.toml > "$tmp_file"
+    cat "$tmp_file" > Cargo.toml
     cargo update -w --offline
 
     git add Cargo.toml Cargo.lock
@@ -107,7 +118,7 @@ _validate_release_version version:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    project_version=$(grep -Po '(?<=^version = ").*(?=")' Cargo.toml)
+    project_version=$(sed -n '/^\[package\]$/,/^\[/ s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
     if [[ "$project_version" != "{{ version }}" ]]; then
       echo "Project version $project_version does not match release version {{ version }}"
       exit 1
@@ -118,7 +129,7 @@ _validate_version_tag:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    project_version=$(grep -Po '(?<=^version = ").*(?=")' Cargo.toml)
+    project_version=$(sed -n '/^\[package\]$/,/^\[/ s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
     git_tag=$(git describe --exact-match --tags)
     if [[ "$project_version" != "${git_tag#v}" ]]; then
       echo "Project version $project_version does not match Git tag $git_tag"
@@ -149,10 +160,28 @@ _changelog_add_version version filename=CHANGELOG_FILE:
     #!/usr/bin/env bash
     set -euxo pipefail
 
-    previous_version=$(sed -n '/^\[unreleased\]:/ { n; s/^\[\([^]]*\)\].*/\1/p }' "{{ filename }}")
-    sed -i '/^## \[Unreleased\]$/ { N; s/\n/\n\n## [{{ version }}] - {{ datetime("%Y-%m-%d") }}\n/ }' "{{ filename }}"
-    sed -i '/^\[unreleased\]:/ s/v[0-9.]\+\b/v{{ version }}.../; /^\[unreleased\]:/ a\
-    [{{ version }}]: {{ REPO_URL }}/compare/v'"$previous_version"'...v{{ version }}' "{{ filename }}"
+    previous_version=$(sed -n '/^\[unreleased\]:/ { n; s/^\[\([^]]*\)\].*/\1/p; }' "{{ filename }}")
+    tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
+    awk \
+      -v version="{{ version }}" \
+      -v date="{{ datetime("%Y-%m-%d") }}" \
+      -v repo="{{ REPO_URL }}" \
+      -v previous="$previous_version" '
+      $0 == "## [Unreleased]" {
+        print
+        print ""
+        print "## [" version "] - " date
+        next
+      }
+      /^\[unreleased\]:/ {
+        print "[unreleased]: " repo "/compare/v" version "...HEAD"
+        print "[" version "]: " repo "/compare/v" previous "...v" version
+        next
+      }
+      { print }
+    ' "{{ filename }}" > "$tmp_file"
+    cat "$tmp_file" > "{{ filename }}"
 
     git add "{{ filename }}"
     git commit -m "Update {{ filename }}"
