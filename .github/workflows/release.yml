@@ -35,6 +35,8 @@ jobs:
           ref: ${{ inputs.tag }}
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        with:
+          use-flakehub: false
 
       - name: Build release archives
         run: nix build .#release-artifacts --out-link release-artifacts --no-update-lock-file
@@ -137,7 +139,8 @@ jobs:
       contents: write
     steps:
       - name: Publish GitHub release
-        run: gh release edit "$TAG" --draft=false --latest
+        run: gh release edit "$TAG" --draft=false --latest --repo "$GH_REPO"
         env:
+          GH_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
