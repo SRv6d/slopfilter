@@ -32,6 +32,12 @@ Install `slopfilter` from [crates.io] using Cargo:
 cargo install --locked slopfilter
 ```
 
+### Using Homebrew
+
+```sh
+brew install --cask srv6d/tap/slopfilter
+```
+
 ## Usage
 
 Set a Pangram API key, then choose an input source:
