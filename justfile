@@ -1,6 +1,6 @@
 export CI := env("CI", "false")
 CHANGELOG_FILE := "CHANGELOG.md"
-REPO_URL := "https://github.com/SRv6d/slopfilter"
+REPO_URL := "https://github.com/marvinvogt/slopfilter"
 LCOV_FILE := "target/coverage/lcov.info"
 
 default: check-lockfile lint test

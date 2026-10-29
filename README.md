@@ -1,7 +1,7 @@
 <h1 align="center"><code>slopfilter</code></h1>
 <div align="center">
-  <a href="https://github.com/SRv6d/slopfilter/actions/workflows/test.yml">
-    <img src="https://github.com/SRv6d/slopfilter/actions/workflows/test.yml/badge.svg?branch=main" alt="Test status" />
+  <a href="https://github.com/marvinvogt/slopfilter/actions/workflows/test.yml">
+    <img src="https://github.com/marvinvogt/slopfilter/actions/workflows/test.yml/badge.svg?branch=main" alt="Test status" />
   </a>
   <a href="https://crates.io/crates/slopfilter">
     <img src="https://img.shields.io/crates/v/slopfilter.svg?logo=rust" alt="Cargo version" />
@@ -21,7 +21,7 @@ Release archives can be verified with the GitHub CLI:
 
 ```sh
 gh attestation verify slopfilter-v0.1.0-aarch64-apple-darwin.tar.gz \
-  --repo SRv6d/slopfilter
+  --repo marvinvogt/slopfilter
 ```
 
 ### Using Cargo
@@ -35,7 +35,7 @@ cargo install --locked slopfilter
 ### Using Homebrew
 
 ```sh
-brew install --cask srv6d/tap/slopfilter
+brew install --cask marvinvogt/tap/slopfilter
 ```
 
 ## Usage
@@ -76,4 +76,4 @@ This project is licensed under the [MIT License](LICENSE).
 [crates.io]: https://crates.io/crates/slopfilter
 [Matter]: https://www.getmatter.com
 [Pangram]: https://www.pangram.com
-[release]: https://github.com/SRv6d/slopfilter/releases
+[release]: https://github.com/marvinvogt/slopfilter/releases
