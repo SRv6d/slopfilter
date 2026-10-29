@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Homebrew installation through `SRv6d/homebrew-tap`.
+- Homebrew installation through `marvinvogt/homebrew-tap`.
 
 ### Fixed
 
@@ -27,5 +27,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit request timeouts, Matter rate-limit handling, terminal progress output, and `NO_COLOR` support.
 - Reproducible pre-built Linux and macOS binaries with SHA-256 checksums and build provenance attestations.
 
-[unreleased]: https://github.com/SRv6d/slopfilter/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/SRv6d/slopfilter/releases/tag/v0.1.0
+[unreleased]: https://github.com/marvinvogt/slopfilter/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/marvinvogt/slopfilter/releases/tag/v0.1.0
